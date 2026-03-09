@@ -1,0 +1,54 @@
+version: "3.9"
+
+services:
+  # ── PostgreSQL ────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       translation_proxy
+      POSTGRES_USER:     proxy_user
+      POSTGRES_PASSWORD: proxy_pass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U proxy_user -d translation_proxy"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── Control Plane API ─────────────────────────────────────────────────────────
+  control-plane:
+    build:
+      context: ./control_plane
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL:           postgresql://proxy_user:proxy_pass@postgres/translation_proxy
+      OUR_SERVER_IP:          "0.0.0.0"          # Override with your real IP in production
+      CERTBOT_EMAIL:          admin@example.com
+      NGINX_SITES_ENABLED:    /tmp/nginx/sites-enabled
+      NGINX_SITES_AVAILABLE:  /tmp/nginx/sites-available
+      NGINX_ACME_WEBROOT:     /tmp/nginx/acme
+      NGINX_SNIPPETS_DIR:     /tmp/nginx/snippets
+      LETSENCRYPT_LIVE:       /tmp/letsencrypt/live
+    ports:
+      - "8000:8000"
+    volumes:
+      - nginx_configs:/tmp/nginx
+      - letsencrypt:/tmp/letsencrypt
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  nginx_configs:
+  letsencrypt:
