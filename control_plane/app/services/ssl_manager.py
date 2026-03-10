@@ -124,45 +124,57 @@ def issue_certificate(domain: str) -> Tuple[bool, str]:
 def pre_issue_checks(domain: str) -> Tuple[bool, str]:
     """
     Validate that the ACME challenge can succeed BEFORE calling certbot.
+
+    Tests locally via nginx on localhost to avoid firewall/DNS issues.
+    Uses Host header so nginx routes to the correct server block.
     Returns (ok, error_message).
     """
     import urllib.request
     import urllib.error
 
     webroot = settings.NGINX_ACME_WEBROOT
-    token   = "pre-check-test-token"
-    path    = Path(webroot) / ".well-known" / "acme-challenge" / token
+    token   = "pre-check-proxy-test"
+    fpath   = Path(webroot) / ".well-known" / "acme-challenge" / token
+
+    # 1. Write test token to webroot
+    fpath.parent.mkdir(parents=True, exist_ok=True)
+    fpath.write_text("ok")
 
     issues = []
-
-    # 1. Write test token
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("ok")
-
-    # 2. Try to fetch it over HTTP
     try:
-        url = f"http://{domain}/.well-known/acme-challenge/{token}"
-        req = urllib.request.Request(url, headers={"User-Agent": "proxy-pre-check/1.0"})
+        # 2. Fetch via localhost with Host header - bypasses DNS/firewall completely
+        #    This is exactly how certbot's webroot plugin works from the server side.
+        url = f"http://127.0.0.1/.well-known/acme-challenge/{token}"
+        req = urllib.request.Request(
+            url,
+            headers={"Host": domain, "User-Agent": "proxy-pre-check/1.0"}
+        )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            body = resp.read().decode()
-            if body.strip() != "ok":
-                issues.append(f"Webroot test file returned unexpected content: {body[:100]}")
+            body = resp.read().decode().strip()
+            if body != "ok":
+                issues.append(
+                    f"Webroot served wrong content (got: {body[:50]!r}, expected: 'ok'). "
+                    f"Check /var/www/acme-challenge permissions."
+                )
     except urllib.error.HTTPError as e:
-        issues.append(f"HTTP {e.code} fetching ACME test URL {url}")
+        issues.append(
+            f"Nginx returned HTTP {e.code} for ACME challenge path. "
+            f"Check nginx config: the default server must serve /.well-known/acme-challenge/"
+        )
     except Exception as e:
         issues.append(
-            f"Cannot reach http://{domain}/.well-known/acme-challenge/ — "
-            f"port 80 may be blocked or nginx not running. Error: {e}"
+            f"Cannot reach nginx on localhost:80 — nginx may not be running. "
+            f"Run: systemctl status nginx. Error: {e}"
         )
     finally:
         try:
-            path.unlink()
+            fpath.unlink()
         except Exception:
             pass
 
     if issues:
         return False, "\n".join(issues)
-    return True, "Pre-checks passed: port 80 reachable and webroot serving correctly"
+    return True, "Pre-checks passed: nginx is serving ACME webroot correctly"
 
 
 def revoke_and_delete_certificate(domain: str) -> Tuple[bool, str]:
