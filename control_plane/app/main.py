@@ -99,6 +99,69 @@ def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
 
+@app.get("/debug/domain/{domain}", tags=["System"])
+def debug_domain(domain: str, db: Session = Depends(get_db)):
+    """
+    Diagnose the full proxy setup for a domain.
+    Shows exactly what nginx config exists and what the proxy will do.
+    Remove or restrict this endpoint in production.
+    """
+    import subprocess, os
+    from pathlib import Path
+
+    obj = db.query(Domain).filter(Domain.domain == domain).first()
+
+    # Check nginx config files
+    sites_enabled  = Path(settings.NGINX_SITES_ENABLED)
+    conf_path      = sites_enabled / f"{domain}.conf"
+    http_conf_path = sites_enabled / f"{domain}.http.conf"
+
+    nginx_conf_exists  = conf_path.exists()
+    nginx_http_exists  = http_conf_path.exists()
+    nginx_conf_content = conf_path.read_text() if nginx_conf_exists else None
+
+    # Check cert files
+    cert_readable = False
+    cert_expiry   = None
+    if obj and obj.ssl_cert_path:
+        try:
+            Path(obj.ssl_cert_path).read_bytes()
+            cert_readable = True
+            from .services.ssl_manager import get_cert_expiry
+            cert_expiry = str(get_cert_expiry(domain))
+        except Exception as e:
+            cert_readable = False
+
+    # Check nginx is actually serving it
+    nginx_test = subprocess.run(
+        ["sudo", "nginx", "-T"],
+        capture_output=True, text=True, timeout=10
+    )
+    domain_in_nginx = domain in nginx_test.stdout
+
+    return {
+        "domain": domain,
+        "in_database": obj is not None,
+        "db_status": obj.status if obj else None,
+        "db_ssl_status": obj.ssl_status if obj else None,
+        "db_backend_url": obj.backend_url if obj else None,
+        "db_verified": obj.is_verified if obj else None,
+        "nginx_ssl_config_exists": nginx_conf_exists,
+        "nginx_http_config_exists": nginx_http_exists,
+        "nginx_knows_domain": domain_in_nginx,
+        "cert_path": obj.ssl_cert_path if obj else None,
+        "cert_readable_by_app": cert_readable,
+        "cert_expiry": cert_expiry,
+        "nginx_conf_preview": nginx_conf_content[:500] if nginx_conf_content else None,
+        "action_needed": (
+            "provision-ssl" if obj and not nginx_conf_exists else
+            "verify domain first" if obj and not obj.is_verified else
+            "register domain first" if not obj else
+            "looks good - check Cloudflare proxy is enabled (orange cloud)"
+        )
+    }
+
+
 # ── Customers ─────────────────────────────────────────────────────────────────
 
 @app.post("/customers", response_model=CustomerResponse, status_code=201, tags=["Customers"])
