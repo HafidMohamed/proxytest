@@ -343,6 +343,11 @@ systemctl enable  certbot-proxy-renew.timer
 systemctl restart certbot-proxy-renew.timer
 ok "Certbot timer active (runs daily at 03:00 + 15:00)"
 
+# Fix letsencrypt dir permissions so www-data can read certs
+# certbot creates these as root:root 700 by default
+chmod 755 /etc/letsencrypt/live    2>/dev/null || true
+chmod 755 /etc/letsencrypt/archive 2>/dev/null || true
+
 # ── 12. Fail2ban ──────────────────────────────────────────────────────────────
 systemctl enable fail2ban --now
 
