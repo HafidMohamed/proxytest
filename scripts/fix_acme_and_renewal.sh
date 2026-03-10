@@ -84,36 +84,13 @@ WEBROOT="/var/www/acme-challenge"
 mkdir -p "${WEBROOT}/.well-known/acme-challenge"
 chown -R www-data:www-data "${WEBROOT}"
 
-# Check that nginx has the default HTTP config to serve the webroot
-DEFAULT_HTTP="/etc/nginx/sites-available/000-default-acme.conf"
-if [[ ! -f "${DEFAULT_HTTP}" ]]; then
-    info "Creating default ACME webroot server block..."
-    cat > "${DEFAULT_HTTP}" << 'NGEOF'
-# Catch-all HTTP server – serves ACME challenges for ALL domains.
-# This is hit when a domain's own HTTP config doesn't exist yet.
-server {
-    listen 80 default_server;
-    server_name _;
-
-    location /.well-known/acme-challenge/ {
-        root /var/www/acme-challenge;
-        try_files $uri =404;
-    }
-
-    location / {
-        return 444;
-    }
-}
-NGEOF
-    # Only link if default_server isn't already claimed by another config
-    if ! grep -r "default_server" /etc/nginx/sites-enabled/ 2>/dev/null | grep -v "default_server ssl"; then
-        ln -sf "${DEFAULT_HTTP}" "/etc/nginx/sites-enabled/000-default-acme.conf"
-    fi
-fi
-
-# ── 4. Check existing nginx.conf doesn't have conflicting default_server ──────
-# Remove the built-in default site if present
+# ── 4. Remove any conflicting default_server configs ─────────────────────────
+# nginx.conf already declares the default_server blocks for port 80 and 443.
+# Any other file declaring default_server on the same port causes a fatal error.
+info "Removing conflicting default server configs..."
 rm -f /etc/nginx/sites-enabled/default
+rm -f /etc/nginx/sites-enabled/000-default-acme.conf
+rm -f /etc/nginx/sites-available/000-default-acme.conf
 
 # ── 5. Test and reload nginx ──────────────────────────────────────────────────
 info "Testing nginx configuration..."
