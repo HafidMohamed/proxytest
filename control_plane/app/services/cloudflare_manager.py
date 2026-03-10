@@ -214,43 +214,46 @@ class CloudflareManager:
 
     def update_ufw_rules(self, ips: dict) -> Tuple[bool, str]:
         """
-        Replace UFW rules for ports 80/443 so only Cloudflare IPs are allowed.
+        Lock port 443 to Cloudflare IPs only.
+        Port 80 stays open to ALL IPs — required for Let's Encrypt HTTP-01
+        ACME challenges which come from LE's own servers, not Cloudflare.
 
-        Strategy:
-          1. Delete all existing numbered rules for ports 80/443
-          2. Re-add allow rules for each CF CIDR
-          3. Add deny rules for 80/443 from any (catches non-CF traffic)
-
-        NOTE: Port 8000 (control plane) is NOT touched here – lock that down
-              separately to your own IPs in production.
+        Architecture:
+          port 80  → open to all  (ACME challenge + HTTP→HTTPS redirect only)
+          port 443 → CF IPs only  (all real visitor traffic)
+          port 8000 → untouched   (control plane — restrict manually in prod)
         """
         try:
-            self._ufw_reset_ports()
+            self._ufw_reset_https_only()
             all_cidrs = ips["ipv4"] + ips["ipv6"]
+            # Allow port 443 from each Cloudflare CIDR
             for cidr in all_cidrs:
                 _sudo(["ufw", "allow", "proto", "tcp", "from", cidr, "to", "any",
-                       "port", "80,443", "comment", "cloudflare"])
-            # Deny everything else on 80/443
-            _sudo(["ufw", "deny", "80/tcp"])
+                       "port", "443", "comment", "cloudflare-https"])
+            # Deny all other direct connections to 443
             _sudo(["ufw", "deny", "443/tcp"])
-            # Reload UFW
+            # Port 80 MUST stay fully open for Let's Encrypt ACME HTTP-01 challenges
+            # It is safe: port 80 only serves /.well-known/acme-challenge/ + redirects
+            _sudo(["ufw", "allow", "80/tcp"])
             _sudo(["ufw", "reload"])
-            msg = f"UFW updated: {len(all_cidrs)} Cloudflare ranges allowed on 80/443"
+            msg = (
+                f"UFW updated: port 443 locked to {len(all_cidrs)} Cloudflare ranges. "
+                f"Port 80 open to all (required for ACME/Let's Encrypt)."
+            )
             logger.info(msg)
             return True, msg
         except Exception as exc:
             logger.error("UFW update failed: %s", exc)
             return False, str(exc)
 
-    def _ufw_reset_ports(self):
-        """Delete all UFW rules touching port 80 or 443."""
+    def _ufw_reset_https_only(self):
+        """Delete only UFW rules touching port 443 (leave port 80 alone)."""
         rc, stdout, _ = _sudo(["ufw", "status", "numbered"])
         if rc != 0:
             return
-        # Collect rule numbers that mention port 80 or 443 (reversed so deletes don't shift indices)
         numbers = []
         for line in stdout.splitlines():
-            if ("80" in line or "443" in line) and line.strip().startswith("["):
+            if "443" in line and line.strip().startswith("["):
                 try:
                     num = int(line.strip().split("]")[0].lstrip("["))
                     numbers.append(num)

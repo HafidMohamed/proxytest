@@ -47,7 +47,8 @@ from .services.nginx_manager      import NginxManager
 from .services.cloudflare_manager import CloudflareManager
 from .services import (
     full_domain_check,
-    issue_certificate, cert_exists, cert_paths, get_cert_expiry,
+    issue_certificate, pre_issue_checks,
+    cert_exists, cert_paths, get_cert_expiry,
     revoke_and_delete_certificate, renew_all_certificates,
 )
 
@@ -260,6 +261,24 @@ def provision_ssl(
 
     obj.ssl_status = SSLStatus.PENDING
     db.commit()
+
+    # Pre-flight: verify port 80 is reachable and nginx is serving the ACME webroot
+    # before invoking certbot (gives a clear error instead of a cryptic certbot failure)
+    pre_ok, pre_msg = pre_issue_checks(domain)
+    if not pre_ok:
+        obj.ssl_status = SSLStatus.FAILED
+        db.commit()
+        _log(db, domain, "ssl_preflight_failed", pre_msg)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"ACME pre-flight check failed: {pre_msg}\n\n"
+                "Fix: make sure port 80 is open to ALL IPs (not just Cloudflare). "
+                "Let\'s Encrypt\'s validation servers must reach "
+                f"http://{domain}/.well-known/acme-challenge/ "
+                "Run: ufw allow 80/tcp && nginx -s reload"
+            )
+        )
 
     success, msg = issue_certificate(domain)
     if not success:

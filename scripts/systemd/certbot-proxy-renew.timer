@@ -1,0 +1,15 @@
+# /etc/systemd/system/certbot-proxy-renew.timer
+# Renews certificates at 03:00 and 15:00 daily (with ±1h random jitter
+# so thousands of servers don't all hammer Let's Encrypt at once).
+
+[Unit]
+Description=Translation Proxy – Certbot Certificate Renewal Timer
+Requires=certbot-proxy-renew.service
+
+[Timer]
+OnCalendar=*-*-* 03,15:00:00
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

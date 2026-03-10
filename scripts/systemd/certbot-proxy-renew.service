@@ -1,0 +1,23 @@
+# /etc/systemd/system/certbot-proxy-renew.service
+# Runs certbot renew and reloads nginx for the translation proxy.
+# Triggered by certbot-proxy-renew.timer (twice daily).
+
+[Unit]
+Description=Translation Proxy – Certbot Certificate Renewal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/certbot renew \
+    --non-interactive \
+    --deploy-hook "nginx -s reload" \
+    --config-dir /etc/letsencrypt \
+    --work-dir   /var/lib/letsencrypt \
+    --logs-dir   /var/log/letsencrypt \
+    -v
+ExecStartPost=/bin/bash -c \
+    'curl -sf -X POST http://localhost:8000/ssl/renew-all > /dev/null 2>&1 || true'
+StandardOutput=journal
+StandardError=journal
