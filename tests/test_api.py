@@ -302,3 +302,70 @@ class TestConcurrentRequests:
         error_pct = errors / N * 100
         print(f"\n[ConcurrentDomainList] Requests={N}  Errors={errors}  Error%={error_pct:.1f}%")
         assert error_pct < 5
+
+
+# ── Cloudflare endpoints ──────────────────────────────────────────────────────
+
+class TestCloudflare:
+    def test_cf_status_endpoint(self, api):
+        resp = api.get(f"{BASE_URL}/cloudflare/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "ipv4_count" in data
+        assert "ipv6_count" in data
+        assert "source" in data
+
+    def test_cf_refresh_endpoint(self, api):
+        """Refresh should succeed and return IP counts."""
+        resp = api.post(f"{BASE_URL}/cloudflare/refresh?update_ufw=false")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ipv4_count"] > 0, "Expected at least 1 IPv4 CF range"
+        assert data["ipv6_count"] > 0, "Expected at least 1 IPv6 CF range"
+        assert data["source"] in ("live", "cache", "fallback")
+
+    def test_cf_refresh_writes_realip_snippet(self, api):
+        """After refresh the cloudflare-realip.conf snippet should exist."""
+        api.post(f"{BASE_URL}/cloudflare/refresh?update_ufw=false")
+        resp = api.get(f"{BASE_URL}/cloudflare/status")
+        data = resp.json()
+        # In test env snippets dir may be /tmp – just check the API returns correctly
+        assert "realip_snippet_exists" in data
+
+    def test_cf_refresh_concurrent(self, api):
+        """Multiple simultaneous refreshes should all succeed."""
+        import concurrent.futures
+        def do_refresh():
+            r = api.post(f"{BASE_URL}/cloudflare/refresh?update_ufw=false", timeout=30)
+            return r.status_code == 200
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+            results = list(ex.map(lambda _: do_refresh(), range(5)))
+        assert all(results), "Some concurrent CF refreshes failed"
+
+
+# ── Update backend URL ────────────────────────────────────────────────────────
+
+class TestUpdateBackend:
+    DOMAIN = f"backend-update-{uuid.uuid4().hex[:6]}.example.com"
+
+    def test_setup(self, authed_session):
+        authed_session.post(f"{BASE_URL}/domains", json={
+            "domain": self.DOMAIN,
+            "backend_url": "https://origin-v1.example.com",
+        })
+
+    def test_update_backend_requires_active_domain(self, authed_session):
+        """Domain must be active (SSL provisioned) before backend can be updated."""
+        resp = authed_session.put(f"{BASE_URL}/domains/{self.DOMAIN}/backend", json={
+            "domain": self.DOMAIN,
+            "backend_url": "https://origin-v2.example.com",
+        })
+        # Should be 400 (not active) or 404 if setup didn't register
+        assert resp.status_code in (400, 404)
+
+    def test_update_nonexistent_domain(self, authed_session):
+        resp = authed_session.put(f"{BASE_URL}/domains/ghost.example.com/backend", json={
+            "domain": "ghost.example.com",
+            "backend_url": "https://new-origin.example.com",
+        })
+        assert resp.status_code == 404

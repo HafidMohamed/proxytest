@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql://proxy_user:proxy_pass@localhost/translation_proxy"
 
     # ── Our server ────────────────────────────────────────────────────────────
-    OUR_SERVER_IP: str = "0.0.0.0"          # Public IPv4 of this machine
+    OUR_SERVER_IP: str = "0.0.0.0"
     CONTROL_PLANE_HOST: str = "0.0.0.0"
     CONTROL_PLANE_PORT: int = 8000
 
@@ -19,7 +19,12 @@ class Settings(BaseSettings):
 
     # ── Certbot / Let's Encrypt ───────────────────────────────────────────────
     CERTBOT_EMAIL: str = "admin@example.com"
-    LETSENCRYPT_LIVE: str = "/etc/letsencrypt/live"
+    # These three dirs must be writable by root (certbot runs via sudo)
+    CERTBOT_CONFIG_DIR: str = "/etc/letsencrypt"
+    CERTBOT_WORK_DIR: str   = "/var/lib/letsencrypt"
+    CERTBOT_LOGS_DIR: str   = "/var/log/letsencrypt"
+    # Derived – kept for backward compat
+    LETSENCRYPT_LIVE: str   = "/etc/letsencrypt/live"
 
     # ── Application ───────────────────────────────────────────────────────────
     SECRET_KEY: str = secrets.token_urlsafe(32)
