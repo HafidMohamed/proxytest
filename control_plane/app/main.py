@@ -243,12 +243,10 @@ def _build_instructions(d: Domain) -> DomainVerificationInstructions:
         txt_record_value=txt_value,
         a_record_value=settings.OUR_SERVER_IP,
         instructions=(
-            f"Add these two DNS records at your registrar, then call /verify:\n\n"
+            
             f"  TYPE  NAME                VALUE\n"
             f"  TXT   {txt_name}  \"{txt_value}\"\n"
             f"  A     {d.domain}  {settings.OUR_SERVER_IP}\n\n"
-            f"Important: If using Cloudflare, set the A record proxy status to "
-            f"'Proxied' (orange cloud) so traffic flows through Cloudflare."
         ),
     )
 
@@ -291,7 +289,7 @@ def verify_domain(
     obj.status      = DomainStatus.VERIFIED
     db.commit()
     return MessageResponse(
-        message="Domain verified. Call /provision-ssl to activate HTTPS.",
+        message="Domain verified.",
         detail=str(details),
     )
 
