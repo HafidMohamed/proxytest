@@ -2,14 +2,13 @@
 SSL certificate lifecycle manager.
 
 Uses certbot (Let's Encrypt) webroot plugin.
-certbot runs via sudo so www-data can write to /etc/letsencrypt.
+certbot runs via sudo so it can write to /etc/letsencrypt.
 
 Permission model
 ----------------
 certbot writes certs as root:root with 700 permissions by default.
 After every issuance/renewal we chmod 755 the per-domain dirs so
 www-data (the app user) can read them.
-This is done for EVERY customer domain dynamically — never hardcoded.
 """
 
 import logging
@@ -26,18 +25,42 @@ logger = logging.getLogger(__name__)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _run(cmd: list[str], timeout: int = 120) -> Tuple[int, str, str]:
-    """Run command via sudo, return (returncode, stdout, stderr)."""
-    full_cmd = ["sudo"] + cmd
+def _run(cmd: list, timeout: int = 120) -> Tuple[int, str, str]:
+    """
+    Run a command via sudo with full exception handling.
+
+    BUG FIX: Original had no try/except — if certbot was not installed,
+    subprocess.run raised FileNotFoundError which propagated all the way up
+    through provision_ssl with no JSON error response, leaving clients with
+    a blank HTTP response body ("Expecting value: line 1 column 1 (char 0)").
+    Now we catch all subprocess exceptions and return a (1, "", error_msg)
+    tuple so provision_ssl can generate a proper HTTPException(500).
+    """
+    full_cmd = ["sudo"] + [str(c) for c in cmd]
     logger.info("Running: %s", " ".join(full_cmd))
-    result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=timeout)
-    if result.returncode != 0:
-        logger.warning("Command failed (%d):\nSTDOUT: %s\nSTDERR: %s",
-                       result.returncode, result.stdout, result.stderr)
-    return result.returncode, result.stdout, result.stderr
+    try:
+        result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            logger.warning(
+                "Command failed (%d):\nSTDOUT: %s\nSTDERR: %s",
+                result.returncode, result.stdout, result.stderr,
+            )
+        return result.returncode, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        logger.error("Command timed out after %ds: %s", timeout, " ".join(full_cmd))
+        return 1, "", f"Command timed out after {timeout}s: {full_cmd[1]}"
+    except FileNotFoundError as exc:
+        logger.error("Command not found: %s — is it installed?", full_cmd[1])
+        return 1, "", (
+            f"'{full_cmd[1]}' not found. "
+            "Run: apt-get install -y certbot"
+        )
+    except Exception as exc:
+        logger.exception("Unexpected error running %s", full_cmd)
+        return 1, "", f"Unexpected error: {exc}"
 
 
-def _certbot_dirs() -> list[str]:
+def _certbot_dirs() -> list:
     """Common certbot dir flags — prevents read-only filesystem errors."""
     return [
         "--config-dir", settings.CERTBOT_CONFIG_DIR,
@@ -52,18 +75,13 @@ def _fix_cert_permissions(domain: str) -> None:
 
     certbot writes certs as root:root 700.  www-data needs read access.
     Called after every issuance and renewal for each domain.
-
-    This is intentionally per-domain — not a blanket chmod on all of
-    /etc/letsencrypt — so we only expose the minimum needed.
     """
     live_dir    = f"{settings.CERTBOT_CONFIG_DIR}/live/{domain}"
     archive_dir = f"{settings.CERTBOT_CONFIG_DIR}/archive/{domain}"
 
-    # Parent dirs need execute bit so www-data can traverse them
     _run(["chmod", "755", f"{settings.CERTBOT_CONFIG_DIR}/live"],    timeout=5)
     _run(["chmod", "755", f"{settings.CERTBOT_CONFIG_DIR}/archive"], timeout=5)
 
-    # Per-customer cert dirs
     for d in [live_dir, archive_dir]:
         if Path(d).exists():
             _run(["chmod", "-R", "755", d], timeout=5)
@@ -72,10 +90,7 @@ def _fix_cert_permissions(domain: str) -> None:
 
 
 def _fix_all_cert_permissions() -> None:
-    """
-    Fix permissions for ALL customer domains after a bulk renewal.
-    Scans /etc/letsencrypt/live/ and fixes each domain found.
-    """
+    """Fix permissions for ALL customer domains after a bulk renewal."""
     live_root = Path(settings.CERTBOT_CONFIG_DIR) / "live"
     if not live_root.exists():
         return
@@ -89,7 +104,6 @@ def _fix_all_cert_permissions() -> None:
             if d.is_dir() and d.name != "README"
         ]
     except PermissionError:
-        # Can't list — fix the parent first then retry
         _run(["chmod", "755", str(live_root)], timeout=5)
         domains = []
 
@@ -110,7 +124,6 @@ def cert_exists(domain: str) -> bool:
     try:
         return (d / "fullchain.pem").exists() and (d / "privkey.pem").exists()
     except PermissionError:
-        # Cert exists but www-data can't read it — fix and retry
         logger.warning("PermissionError reading cert for %s — fixing permissions", domain)
         _fix_cert_permissions(domain)
         try:
@@ -151,25 +164,27 @@ def issue_certificate(domain: str) -> Tuple[bool, str]:
         "--non-interactive",
         "--keep-until-expiring",
         "-v",
-        "--deploy-hook", "nginx -s reload",
+        # BUG FIX: use full path to nginx binary so the deploy hook works
+        # regardless of what PATH certbot inherits when run via sudo.
+        "--deploy-hook", "/usr/sbin/nginx -s reload",
     ] + _certbot_dirs()
 
     rc, stdout, stderr = _run(cmd, timeout=180)
 
     if rc == 0:
-        # Fix permissions for THIS customer's domain immediately after issuance
         _fix_cert_permissions(domain)
         fullchain, _ = cert_paths(domain)
         logger.info("Certificate issued for %s: %s", domain, fullchain)
         return True, f"Certificate issued: {fullchain}"
 
-    # Build clear error summary from certbot output
+    # Build a clear error summary from certbot output
     combined = (stderr + "\n" + stdout).strip()
     relevant = [
         line.strip() for line in combined.splitlines()
         if any(k in line.lower() for k in
                ["error", "challenge", "failed", "connection", "timeout",
-                "unauthorized", "problem", "could not", "port 80"])
+                "unauthorized", "problem", "could not", "port 80",
+                "not found", "installed"])
     ]
     summary = "\n".join(relevant[:8]) if relevant else combined[:600]
     logger.error("certbot failed for %s:\n%s", domain, combined[:2000])
@@ -188,8 +203,14 @@ def pre_issue_checks(domain: str) -> Tuple[bool, str]:
     token   = "pre-check-proxy-test"
     fpath   = Path(webroot) / ".well-known" / "acme-challenge" / token
 
-    fpath.parent.mkdir(parents=True, exist_ok=True)
-    fpath.write_text("ok")
+    try:
+        fpath.parent.mkdir(parents=True, exist_ok=True)
+        fpath.write_text("ok")
+    except Exception as exc:
+        return False, (
+            f"Cannot write to ACME webroot {webroot}: {exc}. "
+            "Run: chown -R www-data:www-data /var/www/acme-challenge"
+        )
 
     issues = []
     try:
@@ -207,12 +228,12 @@ def pre_issue_checks(domain: str) -> Tuple[bool, str]:
     except urllib.error.HTTPError as e:
         issues.append(
             f"Nginx returned HTTP {e.code} for ACME challenge. "
-            "Check nginx default server block serves /.well-known/acme-challenge/"
+            "Check nginx serves /.well-known/acme-challenge/ on port 80."
         )
     except Exception as e:
         issues.append(
             f"Cannot reach nginx on localhost:80 — is nginx running? "
-            f"Run: systemctl status nginx. Error: {e}"
+            f"Run: systemctl status nginx  Error: {e}"
         )
     finally:
         try:
@@ -247,37 +268,34 @@ def get_cert_expiry(domain: str) -> datetime | None:
     if not cert_exists(domain):
         return None
     fullchain, _ = cert_paths(domain)
-    result = subprocess.run(
-        ["openssl", "x509", "-enddate", "-noout", "-in", fullchain],
-        capture_output=True, text=True, timeout=10,
-    )
-    if result.returncode != 0:
-        return None
     try:
+        result = subprocess.run(
+            ["openssl", "x509", "-enddate", "-noout", "-in", fullchain],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
         date_str = result.stdout.strip().split("=", 1)[1]
         return datetime.strptime(date_str, "%b %d %H:%M:%S %Y %Z").replace(
             tzinfo=timezone.utc)
-    except Exception:
+    except Exception as exc:
+        logger.warning("Could not read cert expiry for %s: %s", domain, exc)
         return None
 
 
 def renew_all_certificates() -> dict:
     """
     Renew all customer certs expiring within 30 days.
-    Fixes permissions for ALL customer domains after renewal so
-    www-data can read every renewed cert.
+    Fixes permissions for ALL customer domains after renewal.
     Called by the systemd certbot-proxy-renew.timer twice daily.
     """
     cmd = [
         "certbot", "renew",
         "--non-interactive",
-        "--deploy-hook", "nginx -s reload",
+        "--deploy-hook", "/usr/sbin/nginx -s reload",
         "-v",
     ] + _certbot_dirs()
 
     rc, stdout, stderr = _run(cmd, timeout=300)
-
-    # Fix permissions for ALL customer domains after bulk renewal
     _fix_all_cert_permissions()
-
     return {"returncode": rc, "stdout": stdout, "stderr": stderr, "success": rc == 0}

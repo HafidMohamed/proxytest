@@ -341,7 +341,22 @@ def provision_ssl(
             )
         )
 
-    success, msg = issue_certificate(domain)
+    # BUG FIX: wrap issue_certificate in try/except.
+    # Previously, if certbot was missing (FileNotFoundError) or any other
+    # unhandled exception occurred, uvicorn would close the connection without
+    # sending an HTTP response, leaving clients with an empty body and
+    # "Expecting value: line 1 column 1 (char 0)" from json.tool.
+    try:
+        success, msg = issue_certificate(domain)
+    except Exception as exc:
+        logger.exception("Unexpected error during cert issuance for %s", domain)
+        obj.ssl_status = SSLStatus.FAILED
+        db.commit()
+        _log(db, domain, "ssl_exception", str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error during SSL issuance: {exc}",
+        )
     if not success:
         obj.ssl_status = SSLStatus.FAILED
         db.commit()

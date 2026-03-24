@@ -14,14 +14,9 @@ Traffic flow (after provision-ssl):
 
 CRITICAL: The domain's A record in Cloudflare DNS MUST be set to
 "Proxied" (orange cloud icon), NOT "DNS only" (grey cloud).
-If it is grey cloud:
-  - Visitor hits our server IP directly
-  - UFW drops port 443 (only CF IPs are allowed)
-  - Browser shows "connection refused" or timeout
 """
 
 import logging
-import os
 import subprocess
 from pathlib import Path
 from typing import Tuple
@@ -32,7 +27,6 @@ logger = logging.getLogger(__name__)
 
 # ── Templates ─────────────────────────────────────────────────────────────────
 
-# Used BEFORE SSL cert is issued — serves ACME challenge on port 80
 _HTTP_ONLY_CONF = """\
 # HTTP-only vhost for {domain} (pre-SSL)
 server {{
@@ -52,7 +46,6 @@ server {{
 }}
 """
 
-# Full production config — used AFTER SSL cert is issued
 _SSL_CONF = """\
 # Reverse-proxy config for {domain}
 # Auto-generated — do not edit manually
@@ -79,23 +72,16 @@ server {{
     listen [::]:443 ssl http2;
     server_name {domain};
 
-    # TLS certificate (issued by Let's Encrypt via provision-ssl)
     ssl_certificate     {ssl_cert};
     ssl_certificate_key {ssl_key};
     include             {snippets_dir}/ssl-params.conf;
 
-    # Only allow connections from Cloudflare IPs on port 443.
-    # Non-CF connections are also blocked by UFW at kernel level.
-    # NOTE: visitor's browser must go through Cloudflare (orange cloud in DNS).
+    # Only allow Cloudflare IPs — blocks direct-to-origin attacks
     include {snippets_dir}/cloudflare-allow.conf;
 
-    # Unwrap real visitor IP from CF-Connecting-IP header.
-    # cloudflare-realip.conf is also included globally in nginx.conf
-    # but per-vhost inclusion ensures it applies even if global include is missing.
-    # nginx deduplicates set_real_ip_from directives automatically.
+    # Unwrap real visitor IP from CF-Connecting-IP header
     include {snippets_dir}/cloudflare-realip.conf;
 
-    # Security headers
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
     add_header X-Content-Type-Options    "nosniff" always;
     add_header X-Frame-Options           "SAMEORIGIN" always;
@@ -103,7 +89,6 @@ server {{
 
     # ── Proxy ALL requests to customer's backend ──────────────────────────────
     location / {{
-        # Forward to customer's origin server stored in database
         proxy_pass {backend_url};
 
         proxy_http_version 1.1;
@@ -112,46 +97,35 @@ server {{
         proxy_set_header Upgrade    $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
 
-        # Send backend's own hostname as Host so it accepts the request.
-        # $proxy_host = hostname extracted from proxy_pass URL.
-        # e.g. proxy_pass https://origin.example.com → Host: origin.example.com
-        # e.g. proxy_pass https://1.2.3.4            → Host: 1.2.3.4
+        # Use the backend's hostname as the Host header
         proxy_set_header Host $proxy_host;
 
-        # Tell backend who the real visitor is
+        # Tell backend the real visitor IP (unwrapped from CF-Connecting-IP)
         proxy_set_header X-Real-IP         $remote_addr;
         proxy_set_header X-Forwarded-For   $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Original-Host   $host;
 
-        # Forward Cloudflare metadata to backend (useful for geo-blocking, bot detection)
+        # Forward Cloudflare metadata to backend
         proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
         proxy_set_header CF-IPCountry     $http_cf_ipcountry;
         proxy_set_header CF-Ray           $http_cf_ray;
 
-        # Don't reveal backend server identity
         proxy_hide_header X-Powered-By;
         proxy_hide_header Server;
 
-        # TLS to HTTPS backends
-        # proxy_ssl_server_name on  → sends correct SNI for hostname-based backends
-        # proxy_ssl_verify off      → accepts self-signed certs on private origins
+        # Accept self-signed certs on private/IP origins
         proxy_ssl_server_name on;
         proxy_ssl_verify      off;
 
-        # Timeouts — increase proxy_read_timeout for slow backends
         proxy_connect_timeout 15s;
         proxy_send_timeout    60s;
         proxy_read_timeout    60s;
 
-        # Response buffering — improves performance under load
         proxy_buffering         on;
         proxy_buffer_size       16k;
         proxy_buffers          16 16k;
         proxy_busy_buffers_size 32k;
-
-        # DO NOT set proxy_intercept_errors — it intercepts backend redirects
-        # and 404s which breaks most websites. Let backend responses pass through.
     }}
 }}
 """
@@ -174,11 +148,61 @@ resolver_timeout 5s;
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _run(cmd: list[str], timeout: int = 30) -> Tuple[int, str, str]:
+def _run(cmd: list, timeout: int = 30) -> Tuple[int, str, str]:
+    """
+    Run a command via sudo with full exception handling.
+
+    BUG FIX: Original had no try/except — FileNotFoundError (command not
+    found) or TimeoutExpired would propagate unhandled and could kill the
+    uvicorn worker, producing a blank HTTP response instead of a JSON error.
+    """
+    full_cmd = ["sudo"] + [str(c) for c in cmd]
+    logger.info("Running: %s", " ".join(full_cmd))
+    try:
+        result = subprocess.run(
+            full_cmd, capture_output=True, text=True, timeout=timeout
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Command failed (%d):\nSTDOUT: %s\nSTDERR: %s",
+                result.returncode, result.stdout, result.stderr,
+            )
+        return result.returncode, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        logger.error("Command timed out after %ds: %s", timeout, " ".join(full_cmd))
+        return 1, "", f"Command timed out after {timeout}s"
+    except FileNotFoundError as exc:
+        logger.error("Command not found: %s — is it installed?", full_cmd[1])
+        return 1, "", f"Command not found: {full_cmd[1]}: {exc}"
+    except Exception as exc:
+        logger.exception("Unexpected error running %s", full_cmd)
+        return 1, "", f"Unexpected error: {exc}"
+
+
+def _write(path: Path, content: str) -> None:
+    """
+    Write file content using sudo tee (handles root-owned directories).
+
+    BUG FIX: Original used path.write_text() directly, which fails when the
+    app runs as www-data because /etc/nginx/sites-available/ and
+    /etc/nginx/sites-enabled/ are owned by root.  We now mirror the pattern
+    used in cloudflare_manager.py — pipe content through 'sudo tee' so the
+    write succeeds regardless of directory ownership.
+    """
+    # Ensure parent directory exists
+    rc, _, err = _run(["mkdir", "-p", str(path.parent)], timeout=10)
+    if rc != 0:
+        raise RuntimeError(f"mkdir -p {path.parent} failed: {err}")
+
     result = subprocess.run(
-        ["sudo"] + cmd, capture_output=True, text=True, timeout=timeout
+        ["sudo", "tee", str(path)],
+        input=content,
+        capture_output=True,
+        text=True,
+        timeout=15,
     )
-    return result.returncode, result.stdout, result.stderr
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to write {path}: {result.stderr}")
 
 
 def _available_path(domain: str, suffix: str = "") -> Path:
@@ -190,23 +214,30 @@ def _enabled_path(domain: str, suffix: str = "") -> Path:
 
 
 def _enable(domain: str, suffix: str = "") -> None:
+    """
+    Create symlink sites-enabled → sites-available using sudo ln.
+
+    BUG FIX: Original used enbld.symlink_to() directly, which fails for
+    www-data because /etc/nginx/sites-enabled/ is root-owned.
+    """
     avail = _available_path(domain, suffix)
     enbld = _enabled_path(domain, suffix)
-    if enbld.exists() or enbld.is_symlink():
-        enbld.unlink()
-    # Use absolute path for symlink target — avoids breakage if cwd changes
-    enbld.symlink_to(avail.resolve())
+    # Remove stale symlink first
+    _run(["rm", "-f", str(enbld)], timeout=10)
+    # Create new symlink (use absolute resolved path as target)
+    rc, _, err = _run(["ln", "-sf", str(avail.resolve()), str(enbld)], timeout=10)
+    if rc != 0:
+        raise RuntimeError(f"Failed to enable {domain}{suffix}: {err}")
 
 
 def _disable(domain: str, suffix: str = "") -> None:
+    """
+    Remove sites-enabled symlink using sudo rm.
+
+    BUG FIX: Original used enbld.unlink() directly — fails for www-data.
+    """
     enbld = _enabled_path(domain, suffix)
-    if enbld.exists() or enbld.is_symlink():
-        enbld.unlink()
-
-
-def _write(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
+    _run(["rm", "-f", str(enbld)], timeout=10)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -224,12 +255,18 @@ class NginxManager:
             settings.NGINX_SNIPPETS_DIR,
             settings.NGINX_ACME_WEBROOT,
         ]:
-            os.makedirs(d, exist_ok=True)
+            try:
+                Path(d).mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                _run(["mkdir", "-p", d], timeout=10)
 
     def _write_ssl_params(self):
         p = Path(settings.NGINX_SNIPPETS_DIR) / "ssl-params.conf"
         if not p.exists():
-            _write(p, _SSL_PARAMS)
+            try:
+                _write(p, _SSL_PARAMS)
+            except Exception as exc:
+                logger.warning("Could not write ssl-params.conf: %s", exc)
 
     # ── Config writers ────────────────────────────────────────────────────────
 
@@ -247,9 +284,7 @@ class NginxManager:
 
     def remove_http_only_config(self, domain: str) -> None:
         _disable(domain, ".http")
-        p = _available_path(domain, ".http")
-        if p.exists():
-            p.unlink()
+        _run(["rm", "-f", str(_available_path(domain, ".http"))], timeout=10)
 
     def write_ssl_config(
         self, domain: str, backend_url: str, ssl_cert: str, ssl_key: str
@@ -258,9 +293,7 @@ class NginxManager:
         Write the full HTTPS reverse-proxy vhost for a customer domain.
         Proxies ALL requests → customer's backend_url.
         """
-        # Normalise backend_url: strip trailing slash to avoid double-slash
         backend_url = backend_url.rstrip("/")
-
         content = _SSL_CONF.format(
             domain=domain,
             backend_url=backend_url,
@@ -279,9 +312,8 @@ class NginxManager:
     def remove_domain_config(self, domain: str) -> None:
         _disable(domain)
         _disable(domain, ".http")
-        for p in [_available_path(domain), _available_path(domain, ".http")]:
-            if p.exists():
-                p.unlink()
+        _run(["rm", "-f", str(_available_path(domain))], timeout=10)
+        _run(["rm", "-f", str(_available_path(domain, ".http"))], timeout=10)
         logger.info("Config removed: %s", domain)
 
     # ── Nginx control ─────────────────────────────────────────────────────────
@@ -318,18 +350,23 @@ class NginxManager:
     # ── Diagnostics ───────────────────────────────────────────────────────────
 
     def get_domain_config(self, domain: str) -> str | None:
-        """Return the nginx config content for a domain, or None if not found."""
         p = _available_path(domain)
-        return p.read_text() if p.exists() else None
+        try:
+            return p.read_text() if p.exists() else None
+        except PermissionError:
+            return None
 
-    def list_active_domains(self) -> list[str]:
+    def list_active_domains(self) -> list:
         enabled = Path(settings.NGINX_SITES_ENABLED)
         if not enabled.exists():
             return []
-        return [
-            p.stem for p in enabled.iterdir()
-            if p.name.endswith(".conf") and not p.name.endswith(".http.conf")
-        ]
+        try:
+            return [
+                p.stem for p in enabled.iterdir()
+                if p.name.endswith(".conf") and not p.name.endswith(".http.conf")
+            ]
+        except PermissionError:
+            return []
 
     def is_nginx_running(self) -> bool:
         rc, _, _ = _run(["pgrep", "-x", "nginx"])

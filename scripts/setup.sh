@@ -175,7 +175,11 @@ ReadWritePaths=/etc/nginx/sites-available /etc/nginx/sites-enabled /var/www/acme
 WantedBy=multi-user.target
 EOF
 
-# Give www-data passwordless sudo for nginx and certbot only
+# Give www-data passwordless sudo for nginx, certbot, and file operations
+# BUG FIX: original sudoers only covered cloudflare snippet writes.
+# NginxManager also needs to write/symlink/remove files in sites-available
+# and sites-enabled (both root-owned).  Missing entries caused those
+# operations to fail silently → nginx configs never written → proxy broken.
 SUDOERS_FILE="/etc/sudoers.d/www-data-proxy"
 cat > "${SUDOERS_FILE}" << 'SUDOEOF'
 # Translation proxy – allow app user to manage nginx, certbot, and ufw
@@ -184,15 +188,47 @@ www-data ALL=(root) NOPASSWD: /usr/bin/nginx
 www-data ALL=(root) NOPASSWD: /usr/bin/certbot
 www-data ALL=(root) NOPASSWD: /usr/local/bin/certbot
 www-data ALL=(root) NOPASSWD: /usr/sbin/ufw
+www-data ALL=(root) NOPASSWD: /usr/bin/ufw
+
+# Write nginx cloudflare snippets
 www-data ALL=(root) NOPASSWD: /usr/bin/tee /etc/nginx/cloudflare-ips.json
 www-data ALL=(root) NOPASSWD: /usr/bin/tee /etc/nginx/snippets/cloudflare-realip.conf
 www-data ALL=(root) NOPASSWD: /usr/bin/tee /etc/nginx/snippets/cloudflare-allow.conf
+www-data ALL=(root) NOPASSWD: /usr/bin/tee /etc/nginx/snippets/ssl-params.conf
+
+# Write per-customer nginx vhost configs (sites-available)
+www-data ALL=(root) NOPASSWD: /usr/bin/tee /etc/nginx/sites-available/*
+
+# Symlink management for sites-enabled (ln, rm, mkdir)
+www-data ALL=(root) NOPASSWD: /usr/bin/ln
+www-data ALL=(root) NOPASSWD: /bin/ln
+www-data ALL=(root) NOPASSWD: /usr/bin/rm
+www-data ALL=(root) NOPASSWD: /bin/rm
+www-data ALL=(root) NOPASSWD: /usr/bin/mkdir
+www-data ALL=(root) NOPASSWD: /bin/mkdir
+
+# Fix cert permissions after issuance/renewal
+www-data ALL=(root) NOPASSWD: /usr/bin/chmod
+www-data ALL=(root) NOPASSWD: /bin/chmod
+
+# pgrep for health checks
+www-data ALL=(root) NOPASSWD: /usr/bin/pgrep
 SUDOEOF
 chmod 440 "${SUDOERS_FILE}"
 visudo -c -f "${SUDOERS_FILE}" || { echo "ERROR: sudoers syntax"; exit 1; }
 
 chown -R www-data:www-data "${APP_DIR}"
 chown -R www-data:www-data /var/www/acme-challenge
+
+# BUG FIX: Give www-data write access to nginx config directories.
+# Without this, NginxManager.write_http_only_config() and write_ssl_config()
+# would silently fail (they were wrapped in try/except that only logged a
+# warning), meaning nginx proxy configs were NEVER written and customer
+# traffic was never redirected to their backend.
+chown www-data:www-data /etc/nginx/sites-available
+chown www-data:www-data /etc/nginx/sites-enabled
+# Snippets dir also needs to be writable for ssl-params.conf
+chown www-data:www-data /etc/nginx/snippets || true
 
 systemctl daemon-reload
 systemctl enable translation-proxy --now
