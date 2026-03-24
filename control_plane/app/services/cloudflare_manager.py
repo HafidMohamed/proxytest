@@ -68,10 +68,25 @@ def _fetch_url(url: str, timeout: int = 10) -> str:
 
 
 def _sudo(cmd: list[str], timeout: int = 30) -> Tuple[int, str, str]:
-    result = subprocess.run(
-        ["sudo"] + cmd, capture_output=True, text=True, timeout=timeout
-    )
-    return result.returncode, result.stdout, result.stderr
+    """
+    BUG FIX: Original had no try/except — if ufw is missing (FileNotFoundError)
+    or any subprocess call times out, it would propagate unhandled and crash the
+    uvicorn worker, producing a blank 500 Internal Server Error response.
+    """
+    try:
+        result = subprocess.run(
+            ["sudo"] + cmd, capture_output=True, text=True, timeout=timeout
+        )
+        return result.returncode, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        logger.error("Command timed out after %ds: sudo %s", timeout, " ".join(cmd))
+        return 1, "", f"Command timed out after {timeout}s"
+    except FileNotFoundError:
+        logger.error("Command not found: %s — is it installed?", cmd[0])
+        return 1, "", f"Command not found: {cmd[0]}"
+    except Exception as exc:
+        logger.exception("Unexpected error running sudo %s", " ".join(cmd))
+        return 1, "", f"Unexpected error: {exc}"
 
 
 def _write_file_sudo(path: str, content: str) -> None:

@@ -112,9 +112,10 @@ def debug_domain(domain: str, db: Session = Depends(get_db)):
     obj = db.query(Domain).filter(Domain.domain == domain).first()
 
     # Check nginx config files
-    sites_enabled  = Path(settings.NGINX_SITES_ENABLED)
-    conf_path      = sites_enabled / f"{domain}.conf"
-    http_conf_path = sites_enabled / f"{domain}.http.conf"
+    sites_available = Path(settings.NGINX_SITES_AVAILABLE)
+    sites_enabled   = Path(settings.NGINX_SITES_ENABLED)
+    conf_path       = sites_available / f"{domain}.conf"
+    http_conf_path  = sites_enabled  / f"{domain}.http.conf"
 
     nginx_conf_exists  = conf_path.exists()
     nginx_http_exists  = http_conf_path.exists()
@@ -152,7 +153,7 @@ def debug_domain(domain: str, db: Session = Depends(get_db)):
         "cert_path": obj.ssl_cert_path if obj else None,
         "cert_readable_by_app": cert_readable,
         "cert_expiry": cert_expiry,
-        "nginx_conf_preview": nginx_conf_content[:500] if nginx_conf_content else None,
+        "nginx_conf_preview": nginx_conf_content[:2000] if nginx_conf_content else None,
         "action_needed": (
             "provision-ssl" if obj and not nginx_conf_exists else
             "verify domain first" if obj and not obj.is_verified else

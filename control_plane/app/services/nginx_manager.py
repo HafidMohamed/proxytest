@@ -76,11 +76,19 @@ server {{
     ssl_certificate_key {ssl_key};
     include             {snippets_dir}/ssl-params.conf;
 
-    # Only allow Cloudflare IPs — blocks direct-to-origin attacks
-    include {snippets_dir}/cloudflare-allow.conf;
-
-    # Unwrap real visitor IP from CF-Connecting-IP header
-    include {snippets_dir}/cloudflare-realip.conf;
+    # NOTE: Cloudflare IP restriction is enforced at two levels:
+    #   1. UFW firewall (kernel): only CF CIDRs can reach port 443 at all.
+    #   2. nginx default_server: unknown domains get 444 (silent drop).
+    #
+    # We do NOT include cloudflare-allow.conf here because nginx.conf already
+    # includes cloudflare-realip.conf globally, which means by the time a
+    # request reaches this vhost, $remote_addr has been rewritten to the REAL
+    # visitor IP (unwrapped from CF-Connecting-IP). An allow/deny check here
+    # would compare real visitor IPs against Cloudflare CIDRs → 403 Forbidden
+    # for every legitimate visitor.
+    #
+    # Unwrapping is done globally in nginx.conf via:
+    #   include /etc/nginx/snippets/cloudflare-realip.conf;
 
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
     add_header X-Content-Type-Options    "nosniff" always;
