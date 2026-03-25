@@ -69,13 +69,15 @@ def _fetch_url(url: str, timeout: int = 10) -> str:
 
 def _sudo(cmd: list[str], timeout: int = 30) -> Tuple[int, str, str]:
     """
-    BUG FIX: Original had no try/except — if ufw is missing (FileNotFoundError)
-    or any subprocess call times out, it would propagate unhandled and crash the
-    uvicorn worker, producing a blank 500 Internal Server Error response.
+    Run a command, prepending sudo only when NOT already root.
+    Inside Docker (root) sudo is not installed; on bare-metal (www-data) it is needed.
+    Also handles exceptions so callers always get (rc, stdout, stderr).
     """
+    import os
+    full_cmd = (["sudo"] + cmd) if os.getuid() != 0 else cmd
     try:
         result = subprocess.run(
-            ["sudo"] + cmd, capture_output=True, text=True, timeout=timeout
+            full_cmd, capture_output=True, text=True, timeout=timeout
         )
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
@@ -92,7 +94,7 @@ def _sudo(cmd: list[str], timeout: int = 30) -> Tuple[int, str, str]:
 def _write_file_sudo(path: str, content: str) -> None:
     """Write a file to a root-owned path using sudo tee."""
     result = subprocess.run(
-        ["sudo", "tee", path],
+        (["sudo", "tee", path] if __import__("os").getuid() != 0 else ["tee", path]),
         input=content,
         capture_output=True,
         text=True,

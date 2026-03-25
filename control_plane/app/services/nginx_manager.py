@@ -158,13 +158,14 @@ resolver_timeout 5s;
 
 def _run(cmd: list, timeout: int = 30) -> Tuple[int, str, str]:
     """
-    Run a command via sudo with full exception handling.
+    Run a command, prepending sudo only when NOT already root.
 
-    BUG FIX: Original had no try/except — FileNotFoundError (command not
-    found) or TimeoutExpired would propagate unhandled and could kill the
-    uvicorn worker, producing a blank HTTP response instead of a JSON error.
+    Inside Docker the process runs as root (uid 0) — sudo is not installed
+    in the image and prepending it causes FileNotFoundError. On a bare-metal
+    host the app runs as www-data and needs sudo for root-owned nginx paths.
     """
-    full_cmd = ["sudo"] + [str(c) for c in cmd]
+    import os
+    full_cmd = (["sudo"] + [str(c) for c in cmd]) if os.getuid() != 0 else [str(c) for c in cmd]
     logger.info("Running: %s", " ".join(full_cmd))
     try:
         result = subprocess.run(
@@ -188,6 +189,7 @@ def _run(cmd: list, timeout: int = 30) -> Tuple[int, str, str]:
 
 
 def _write(path: Path, content: str) -> None:
+    import os
     """
     Write file content using sudo tee (handles root-owned directories).
 
@@ -203,7 +205,7 @@ def _write(path: Path, content: str) -> None:
         raise RuntimeError(f"mkdir -p {path.parent} failed: {err}")
 
     result = subprocess.run(
-        ["sudo", "tee", str(path)],
+        (["sudo", "tee", str(path)] if os.getuid() != 0 else ["tee", str(path)]),
         input=content,
         capture_output=True,
         text=True,

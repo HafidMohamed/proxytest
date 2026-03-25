@@ -134,8 +134,10 @@ def debug_domain(domain: str, db: Session = Depends(get_db)):
             cert_readable = False
 
     # Check nginx is actually serving it
+    import os
+    _nginx_cmd = ["sudo", "nginx", "-T"] if os.getuid() != 0 else ["nginx", "-T"]
     nginx_test = subprocess.run(
-        ["sudo", "nginx", "-T"],
+        _nginx_cmd,
         capture_output=True, text=True, timeout=10
     )
     domain_in_nginx = domain in nginx_test.stdout
