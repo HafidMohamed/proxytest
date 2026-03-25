@@ -1,5 +1,4 @@
 FROM python:3.12-slim
-
 WORKDIR /app
 
 # System deps
@@ -14,12 +13,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 # App code
 COPY . ./control_plane/
 
-# Pre-create nginx dirs for dev
-RUN mkdir -p /tmp/nginx/{sites-available,sites-enabled,snippets,acme} \
-             /tmp/letsencrypt/live
+# Pre-create nginx dirs
+RUN mkdir -p /etc/nginx/sites-available \
+             /etc/nginx/sites-enabled \
+             /etc/nginx/snippets \
+             /var/www/acme-challenge \
+             /var/log/nginx \
+             /tmp/letsencrypt/live \
+    && rm -f /etc/nginx/sites-enabled/default
 
-EXPOSE 8000
+# Copy entrypoint
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-CMD ["uvicorn", "control_plane.app.main:app", \
-     "--host", "0.0.0.0", "--port", "8000", \
-     "--workers", "2", "--log-level", "info"]
+EXPOSE 80 8000
+
+CMD ["/entrypoint.sh"]
