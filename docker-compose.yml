@@ -1,5 +1,4 @@
 version: "3.9"
-
 services:
   # ── PostgreSQL ────────────────────────────────────────────────────────────────
   postgres:
@@ -25,30 +24,67 @@ services:
       context: ./control_plane
       dockerfile: Dockerfile
     restart: unless-stopped
+    env_file:
+      - .env
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL:           postgresql://proxy_user:proxy_pass@postgres/translation_proxy
-      OUR_SERVER_IP:          "0.0.0.0"          # Override with your real IP in production
-      CERTBOT_EMAIL:          admin@example.com
-      NGINX_SITES_ENABLED:    /tmp/nginx/sites-enabled
-      NGINX_SITES_AVAILABLE:  /tmp/nginx/sites-available
-      NGINX_ACME_WEBROOT:     /tmp/nginx/acme
-      NGINX_SNIPPETS_DIR:     /tmp/nginx/snippets
-      LETSENCRYPT_LIVE:       /tmp/letsencrypt/live
+      DATABASE_URL:          postgresql://proxy_user:proxy_pass@postgres/translation_proxy
+      NGINX_SITES_ENABLED:   /etc/nginx/sites-enabled
+      NGINX_SITES_AVAILABLE: /etc/nginx/sites-available
+      NGINX_ACME_WEBROOT:    /var/www/acme-challenge
+      NGINX_SNIPPETS_DIR:    /etc/nginx/snippets
+      LETSENCRYPT_LIVE:      /etc/letsencrypt/live
+      CERTBOT_CONFIG_DIR:    /etc/letsencrypt
+      CERTBOT_WORK_DIR:      /var/lib/letsencrypt
+      CERTBOT_LOGS_DIR:      /var/log/letsencrypt
     ports:
       - "8000:8000"
     volumes:
-      - nginx_configs:/tmp/nginx
-      - letsencrypt:/tmp/letsencrypt
+      - letsencrypt:/etc/letsencrypt
+      - nginx_configs:/etc/nginx/sites-available
+      - nginx_enabled:/etc/nginx/sites-enabled
+      - nginx_snippets:/etc/nginx/snippets
+      - acme_webroot:/var/www/acme-challenge
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 10s
       timeout: 5s
       retries: 5
 
+
+  # ── Translation Worker ────────────────────────────────────────────────────────
+  # Sits between Nginx and the customer's origin.
+  # Fetches origin HTML, translates visible text via DeepL, streams result back.
+  translation-worker:
+    build:
+      context: ./translation_worker
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DEEPL_API_KEY:          ${DEEPL_API_KEY:-}
+      TARGET_LANG:            ${TARGET_LANG:-DE}
+      WORKER_PORT:            8001
+      MAX_CHARS_PER_REQUEST:  100000
+      HTTPX_TIMEOUT:          20
+      DEEPL_TIMEOUT:          30
+      CACHE_TTL:              300
+      CACHE_MAX_PAGES:        500
+    ports:
+      # Exposed on loopback only — nginx proxy_passes to 127.0.0.1:8001
+      - "127.0.0.1:8001:8001"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8001/worker-health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 volumes:
   postgres_data:
-  nginx_configs:
   letsencrypt:
+  nginx_configs:
+  nginx_enabled:
+  nginx_snippets:
+  acme_webroot:

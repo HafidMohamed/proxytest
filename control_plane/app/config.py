@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     DNS_CHECK_TIMEOUT: float     = 5.0
     DNS_CHECK_RETRIES: int       = 3
 
+    # ── Translation worker ────────────────────────────────────────────────────
+    # DEEPL_API_KEY   must be set in .env — Free keys end with ":fx"
+    DEEPL_API_KEY: str = ""
+    TARGET_LANG: str   = "DE"    # BCP-47 language code (uppercase)
+    WORKER_PORT: int   = 8001    # port translation_worker listens on (loopback)
+
     class Config:
         env_file = ".env"
 

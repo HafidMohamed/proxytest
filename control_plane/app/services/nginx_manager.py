@@ -66,10 +66,23 @@ server {{
     }}
 }}
 
-# ── HTTPS: full reverse proxy ─────────────────────────────────────────────────
+# ── HTTPS: translation proxy ──────────────────────────────────────────────────
+#
+# Traffic flow:
+#   Visitor → Nginx (TLS) → translation_worker:8001 → {backend_url}
+#
+# The translation_worker service:
+#   1. Fetches the origin (URL passed in X-Upstream-URL header).
+#   2. If the response is HTML, extracts all visible text nodes, sends them to
+#      DeepL, and splices the translations back into the DOM.
+#   3. Passes non-HTML responses (images, CSS, JS, …) straight through.
+#   4. Streams the (possibly rewritten) response back to nginx → visitor.
+#
 server {{
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    listen 443 ssl;
+    http2 on;
+    listen [::]:443 ssl;
+    http2 on;
     server_name {domain};
 
     ssl_certificate     {ssl_cert};
@@ -86,35 +99,48 @@ server {{
     # visitor IP (unwrapped from CF-Connecting-IP). An allow/deny check here
     # would compare real visitor IPs against Cloudflare CIDRs → 403 Forbidden
     # for every legitimate visitor.
-    #
-    # Unwrapping is done globally in nginx.conf via:
-    #   include /etc/nginx/snippets/cloudflare-realip.conf;
 
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
     add_header X-Content-Type-Options    "nosniff" always;
     add_header X-Frame-Options           "SAMEORIGIN" always;
     add_header Referrer-Policy           "strict-origin-when-cross-origin" always;
 
-    # ── Proxy ALL requests to customer's backend ──────────────────────────────
+    # ── Route ALL requests through the translation worker ─────────────────────
+    #
+    # We tell the worker two things via custom headers:
+    #   X-Upstream-URL   — the full URL to fetch from origin
+    #   X-Translate-Lang — target language (default: from DEEPL_TARGET_LANG env)
+    #
+    # $request_uri preserves the path + query string verbatim.
+    # $scheme is always https here (TLS terminated by this block).
+    #
     location / {{
-        proxy_pass {backend_url};
+        # Build the origin URL nginx passes to the worker.
+        # proxy_set_header cannot contain variables set by set in the same block
+        # when using proxy_pass to a named upstream, so we use a Lua-free trick:
+        # set the variable first, then reference it.
+        set $upstream_url {backend_url}$request_uri;
+
+        # Forward to translation worker (localhost, plain HTTP internally)
+        proxy_pass http://127.0.0.1:{worker_port};
 
         proxy_http_version 1.1;
 
-        # WebSocket support
+        # Routing headers consumed by the worker (stripped before going to origin)
+        proxy_set_header X-Upstream-URL   $upstream_url;
+        proxy_set_header X-Translate-Lang {target_lang};
+
+        # WebSocket support — worker passes Upgrade through for non-HTML
         proxy_set_header Upgrade    $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
 
-        # Use the backend's hostname as the Host header
-        proxy_set_header Host $proxy_host;
-
-        # Tell backend the real visitor IP (unwrapped from CF-Connecting-IP)
+        # Pass the real visitor IP so the origin/worker can log it correctly
         proxy_set_header X-Real-IP         $remote_addr;
         proxy_set_header X-Forwarded-For   $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Original-Host   $host;
 
-        # Forward Cloudflare metadata to backend
+        # Forward Cloudflare metadata
         proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
         proxy_set_header CF-IPCountry     $http_cf_ipcountry;
         proxy_set_header CF-Ray           $http_cf_ray;
@@ -122,8 +148,8 @@ server {{
         proxy_hide_header X-Powered-By;
         proxy_hide_header Server;
 
-        # Accept self-signed certs on private/IP origins
-        proxy_ssl_server_name on;
+        # Worker talks plain HTTP; no SSL needed on the loopback leg
+        proxy_ssl_server_name off;
         proxy_ssl_verify      off;
 
         proxy_connect_timeout 15s;
@@ -297,13 +323,34 @@ class NginxManager:
         _run(["rm", "-f", str(_available_path(domain, ".http"))], timeout=10)
 
     def write_ssl_config(
-        self, domain: str, backend_url: str, ssl_cert: str, ssl_key: str
+        self,
+        domain: str,
+        backend_url: str,
+        ssl_cert: str,
+        ssl_key: str,
+        worker_port: int = None,
+        target_lang: str = None,
     ) -> str:
         """
         Write the full HTTPS reverse-proxy vhost for a customer domain.
-        Proxies ALL requests → customer's backend_url.
+
+        Traffic is routed:
+          Nginx (TLS) → translation_worker:worker_port → backend_url
+
+        The translation worker fetches the origin, translates HTML via DeepL,
+        and streams the result back.  Non-HTML responses are passed unchanged.
+
+        Args:
+            domain:      Customer's public hostname.
+            backend_url: Origin URL (e.g. https://origin.example.com).
+            ssl_cert:    Path to TLS certificate file.
+            ssl_key:     Path to TLS private key file.
+            worker_port: Port translation_worker listens on (default: WORKER_PORT / 8001).
+            target_lang: DeepL target language code (default: TARGET_LANG / "DE").
         """
         backend_url = backend_url.rstrip("/")
+        effective_worker_port = worker_port or getattr(settings, "WORKER_PORT", 8001)
+        effective_target_lang = target_lang or getattr(settings, "TARGET_LANG", "DE")
         content = _SSL_CONF.format(
             domain=domain,
             backend_url=backend_url,
@@ -311,13 +358,18 @@ class NginxManager:
             ssl_key=ssl_key,
             acme_webroot=settings.NGINX_ACME_WEBROOT,
             snippets_dir=settings.NGINX_SNIPPETS_DIR,
+            worker_port=effective_worker_port,
+            target_lang=effective_target_lang,
         )
-        path = _available_path(domain)
-        _write(path, content)
+        avail = _available_path(domain)
+        _write(avail, content)
         _enable(domain)
         self.remove_http_only_config(domain)
-        logger.info("SSL proxy config written: %s → %s", domain, backend_url)
-        return str(path)
+        logger.info(
+            "SSL proxy config written: %s → worker:%s → %s (lang=%s)",
+            domain, effective_worker_port, backend_url, effective_target_lang,
+        )
+        return str(avail)
 
     def remove_domain_config(self, domain: str) -> None:
         _disable(domain)
@@ -346,10 +398,19 @@ class NginxManager:
         return False, f"nginx reload failed: {(out+err).strip()}"
 
     def safe_write_and_reload(
-        self, domain: str, backend_url: str, ssl_cert: str, ssl_key: str
+        self,
+        domain: str,
+        backend_url: str,
+        ssl_cert: str,
+        ssl_key: str,
+        worker_port: int = None,
+        target_lang: str = None,
     ) -> Tuple[bool, str, str]:
         """Write config + reload. Auto-rollback on failure."""
-        config_path = self.write_ssl_config(domain, backend_url, ssl_cert, ssl_key)
+        config_path = self.write_ssl_config(
+            domain, backend_url, ssl_cert, ssl_key,
+            worker_port=worker_port, target_lang=target_lang,
+        )
         ok, msg = self.reload()
         if not ok:
             self.remove_domain_config(domain)
