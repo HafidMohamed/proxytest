@@ -69,6 +69,9 @@ DEEPL_TIMEOUT: float = float(os.environ.get("DEEPL_TIMEOUT", "30"))
 CACHE_TTL: int = int(os.environ.get("CACHE_TTL", "300"))
 CACHE_MAX_PAGES: int = int(os.environ.get("CACHE_MAX_PAGES", "500"))
 
+# Internal control-plane URL for pre-computed page lookups
+CONTROL_PLANE_URL: str = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
+
 # DeepL endpoint: Free keys end with ":fx", Pro keys do not.
 _DEEPL_BASE = (
     "https://api-free.deepl.com/v2"
@@ -295,6 +298,37 @@ async def _fetch_origin(
         return await client.send(req)
 
 
+# ── Pre-computed page lookup (calls control-plane DB cache) ──────────────────
+
+async def _lookup_precomputed(domain: str, lang: str, url: str) -> str | None:
+    """
+    Ask the control-plane if it has a pre-translated version of this URL.
+    Returns HTML string if found, None otherwise.
+    Fast path: the control-plane query is a simple indexed DB lookup.
+    """
+    if not CONTROL_PLANE_URL or not domain:
+        return None
+    from urllib.parse import urlparse, quote
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    lookup_url = (
+        f"{CONTROL_PLANE_URL}/translated/"
+        f"{domain}/{lang.upper()}/{path.lstrip('/')}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=2) as client:
+            resp = await client.get(lookup_url)
+            if resp.status_code == 200:
+                ct = resp.headers.get("content-type", "")
+                if "text/html" in ct:
+                    return resp.text
+    except Exception as exc:
+        logger.debug("Pre-computed lookup failed: %s", exc)
+    return None
+
+
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -334,11 +368,27 @@ async def proxy(request: Request, path: str) -> Response:
 
     lang = request.headers.get("x-translate-lang", TARGET_LANG).upper()
 
-    # ── Cache lookup (GET only) ───────────────────────────────────────────────
+    # ── 1. Check pre-computed DB cache (from crawler) ────────────────────────
+    if request.method == "GET":
+        domain_header = request.headers.get("x-original-host", "")
+        if domain_header:
+            precomputed = await _lookup_precomputed(domain_header, lang, upstream_url)
+            if precomputed is not None:
+                logger.debug("Pre-computed cache hit: %s [%s]", upstream_url, lang)
+                return Response(
+                    content=precomputed.encode("utf-8"),
+                    media_type="text/html; charset=utf-8",
+                    headers={
+                        "X-Translation-Cache": "PRECOMPUTED",
+                        "X-Translated-To": lang,
+                    },
+                )
+
+    # ── 2. In-memory LRU cache (GET only) ────────────────────────────────────
     if request.method == "GET":
         cached = _cache.get(upstream_url, lang)
         if cached is not None:
-            logger.debug("Cache hit: %s", upstream_url)
+            logger.debug("LRU cache hit: %s", upstream_url)
             return Response(
                 content=cached,
                 media_type="text/html; charset=utf-8",
@@ -419,4 +469,59 @@ async def proxy(request: Request, path: str) -> Response:
         status_code=origin_resp.status_code,
         headers=resp_headers,
         media_type=f"text/html; charset={encoding}",
+    )
+
+
+# ── SEO: robots.txt + language sitemaps ──────────────────────────────────────
+# These routes are matched BEFORE the catch-all proxy so they are never
+# forwarded to the origin.
+
+@app.get("/robots.txt", include_in_schema=False)
+async def robots_txt(request: Request) -> Response:
+    """
+    Serve a translated robots.txt that advertises language-specific sitemaps.
+    Delegates to the control-plane which knows which languages are configured.
+    """
+    domain = request.headers.get("x-original-host", "")
+    if domain and CONTROL_PLANE_URL:
+        try:
+            async with httpx.AsyncClient(timeout=3) as client:
+                r = await client.get(f"{CONTROL_PLANE_URL}/translated/{domain}/robots.txt")
+                if r.status_code == 200:
+                    return Response(content=r.content, media_type="text/plain")
+        except Exception:
+            pass
+    # Fallback: fetch robots.txt from origin
+    upstream_url = request.headers.get("x-upstream-url", "")
+    if upstream_url:
+        try:
+            async with httpx.AsyncClient(timeout=5, verify=False) as client:
+                r = await client.get(upstream_url)
+                return Response(content=r.content, media_type="text/plain")
+        except Exception:
+            pass
+    return Response(content=b"User-agent: *\nAllow: /\n", media_type="text/plain")
+
+
+@app.get("/sitemap-{lang}.xml", include_in_schema=False)
+async def language_sitemap(request: Request, lang: str) -> Response:
+    """
+    Serve a language-specific sitemap containing all pre-translated pages.
+    URL pattern: /sitemap-de.xml, /sitemap-fr.xml, etc.
+    Advertised in robots.txt so search engines discover translated content.
+    """
+    domain = request.headers.get("x-original-host", "")
+    if domain and CONTROL_PLANE_URL:
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(
+                    f"{CONTROL_PLANE_URL}/translated/{domain}/{lang.upper()}/sitemap.xml"
+                )
+                if r.status_code == 200:
+                    return Response(content=r.content, media_type="application/xml")
+        except Exception:
+            pass
+    return Response(
+        content=b'<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"/>',
+        media_type="application/xml",
     )

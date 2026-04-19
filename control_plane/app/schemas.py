@@ -85,3 +85,64 @@ class NginxStatusResponse(BaseModel):
 class MessageResponse(BaseModel):
     message: str
     detail: Optional[str] = None
+
+
+# ── Translation / SEO ─────────────────────────────────────────────────────────
+
+from typing import List
+from .models import CrawlFrequency, CrawlStatus
+
+
+class TranslationConfigCreate(BaseModel):
+    """
+    Set up translation for a domain.
+    languages: comma-separated DeepL language codes, e.g. "DE,FR,ES"
+    frequency: hourly | daily | weekly | manual
+    extra_urls: optional newline-separated URLs to always crawl (in addition to sitemap)
+    """
+    languages:  str           = "DE"
+    frequency:  CrawlFrequency = CrawlFrequency.DAILY
+    extra_urls: Optional[str] = None
+
+    @field_validator("languages")
+    @classmethod
+    def validate_languages(cls, v: str) -> str:
+        langs = [l.strip().upper() for l in v.split(",") if l.strip()]
+        if not langs:
+            raise ValueError("At least one language required")
+        return ",".join(langs)
+
+
+class TranslationConfigResponse(BaseModel):
+    id:         UUID
+    domain_id:  UUID
+    languages:  str
+    frequency:  CrawlFrequency
+    extra_urls: Optional[str]
+    last_crawl: Optional[datetime]
+    next_crawl: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class TranslatedPageSummary(BaseModel):
+    id:            UUID
+    url:           str
+    language:      str
+    status:        CrawlStatus
+    error:         Optional[str]
+    crawled_at:    Optional[datetime]
+    origin_status: Optional[str]
+
+    model_config = {"from_attributes": True}
+
+
+class CrawlSummaryResponse(BaseModel):
+    domain:  str
+    urls:    int
+    ok:      int
+    failed:  int
+    langs:   List[str]
+    message: str

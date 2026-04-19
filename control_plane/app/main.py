@@ -42,9 +42,14 @@ from .schemas  import (
     CustomerCreate, CustomerResponse,
     DomainCreate, DomainResponse, DomainVerificationInstructions,
     MessageResponse, NginxStatusResponse,
+    TranslationConfigCreate, TranslationConfigResponse,
+    TranslatedPageSummary, CrawlSummaryResponse,
 )
+from .models import TranslationConfig, TranslatedPage, CrawlFrequency, CrawlStatus
 from .services.nginx_manager      import NginxManager
 from .services.cloudflare_manager import CloudflareManager
+from .services.seo_crawler        import run_crawl, discover_urls, next_crawl_time
+from .services.scheduler          import start_scheduler, stop_scheduler
 from .services import (
     full_domain_check,
     issue_certificate, pre_issue_checks,
@@ -78,6 +83,20 @@ app.add_middleware(
 
 nginx_mgr = NginxManager()
 cf_mgr    = CloudflareManager()
+
+
+@app.on_event("startup")
+async def _startup():
+    start_scheduler(
+        db_session_factory=lambda: next(get_db()),
+        deepl_api_key=settings.DEEPL_API_KEY,
+    )
+    logger.info("Translation scheduler started")
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    stop_scheduler()
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -535,3 +554,351 @@ def _get_owned_domain(domain: str, customer: Customer, db: Session) -> Domain:
 def _log(db: Session, domain: str, event: str, detail: str):
     db.add(ProxyRequestLog(domain=domain, event=event, detail=detail[:2000]))
     db.commit()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TRANSLATION / SEO ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# POST   /translation/{domain}/config          Create / update translation config
+# GET    /translation/{domain}/config          Get current config
+# DELETE /translation/{domain}/config          Remove config + all cached pages
+#
+# GET    /translation/{domain}/pages           List all cached translated pages
+# GET    /translation/{domain}/pages/{lang}    List pages for one language
+#
+# POST   /translation/{domain}/crawl-now       Trigger immediate crawl
+#
+# GET    /translated/{domain}/{lang}/{path}    Serve a translated page (called by worker)
+# GET    /translated/{domain}/{lang}/sitemap.xml  Language-specific sitemap
+# GET    /translated/{domain}/{lang}/robots.txt   Language-aware robots.txt
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+# ── Config management ─────────────────────────────────────────────────────────
+
+@app.post(
+    "/translation/{domain}/config",
+    response_model=TranslationConfigResponse,
+    tags=["Translation"],
+)
+def upsert_translation_config(
+    domain: str,
+    payload: TranslationConfigCreate,
+    customer: Customer = Depends(require_api_key),
+    db: Session = Depends(get_db),
+):
+    """
+    Create or update the translation config for a domain.
+
+    - **languages**: comma-separated DeepL codes, e.g. `DE,FR,ES,IT`
+    - **frequency**: `hourly` | `daily` | `weekly` | `manual`
+    - **extra_urls**: newline-separated extra URLs to always translate
+      (useful for pages not in the sitemap)
+
+    The first save immediately schedules a crawl (next_crawl = now).
+    """
+    obj = _get_owned_domain(domain, customer, db)
+
+    cfg = db.query(TranslationConfig).filter(
+        TranslationConfig.domain_id == obj.id
+    ).first()
+
+    now = datetime.now(timezone.utc)
+
+    if cfg:
+        cfg.languages  = payload.languages
+        cfg.frequency  = payload.frequency
+        cfg.extra_urls = payload.extra_urls
+        cfg.updated_at = now
+        # Reset next_crawl so changes take effect immediately
+        cfg.next_crawl = now
+    else:
+        cfg = TranslationConfig(
+            domain_id  = obj.id,
+            languages  = payload.languages,
+            frequency  = payload.frequency,
+            extra_urls = payload.extra_urls,
+            next_crawl = now,          # crawl ASAP
+        )
+        db.add(cfg)
+
+    db.commit()
+    db.refresh(cfg)
+    return cfg
+
+
+@app.get(
+    "/translation/{domain}/config",
+    response_model=TranslationConfigResponse,
+    tags=["Translation"],
+)
+def get_translation_config(
+    domain: str,
+    customer: Customer = Depends(require_api_key),
+    db: Session = Depends(get_db),
+):
+    obj = _get_owned_domain(domain, customer, db)
+    cfg = db.query(TranslationConfig).filter(
+        TranslationConfig.domain_id == obj.id
+    ).first()
+    if not cfg:
+        raise HTTPException(status_code=404, detail="No translation config for this domain")
+    return cfg
+
+
+@app.delete(
+    "/translation/{domain}/config",
+    status_code=204,
+    tags=["Translation"],
+)
+def delete_translation_config(
+    domain: str,
+    customer: Customer = Depends(require_api_key),
+    db: Session = Depends(get_db),
+):
+    """Remove translation config and all cached translated pages."""
+    obj = _get_owned_domain(domain, customer, db)
+    cfg = db.query(TranslationConfig).filter(
+        TranslationConfig.domain_id == obj.id
+    ).first()
+    if cfg:
+        db.delete(cfg)
+        db.commit()
+
+
+# ── Page listing ──────────────────────────────────────────────────────────────
+
+@app.get(
+    "/translation/{domain}/pages",
+    response_model=List[TranslatedPageSummary],
+    tags=["Translation"],
+)
+def list_translated_pages(
+    domain: str,
+    lang: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    customer: Customer = Depends(require_api_key),
+    db: Session = Depends(get_db),
+):
+    """List cached translated pages. Filter by lang and/or status."""
+    obj = _get_owned_domain(domain, customer, db)
+    cfg = db.query(TranslationConfig).filter(
+        TranslationConfig.domain_id == obj.id
+    ).first()
+    if not cfg:
+        return []
+
+    q = db.query(TranslatedPage).filter(TranslatedPage.config_id == cfg.id)
+    if lang:
+        q = q.filter(TranslatedPage.language == lang.upper())
+    if status:
+        q = q.filter(TranslatedPage.status == status)
+    return q.order_by(TranslatedPage.url).offset(offset).limit(limit).all()
+
+
+# ── Manual crawl trigger ──────────────────────────────────────────────────────
+
+@app.post(
+    "/translation/{domain}/crawl-now",
+    response_model=CrawlSummaryResponse,
+    tags=["Translation"],
+)
+async def crawl_now(
+    domain: str,
+    customer: Customer = Depends(require_api_key),
+    db: Session = Depends(get_db),
+):
+    """
+    Immediately crawl all configured URLs and translate them.
+    Blocks until complete — may take a few minutes for large sites.
+    For large sites prefer the scheduler (daily/weekly).
+    """
+    obj = _get_owned_domain(domain, customer, db)
+    cfg = db.query(TranslationConfig).filter(
+        TranslationConfig.domain_id == obj.id
+    ).first()
+    if not cfg:
+        raise HTTPException(
+            status_code=404,
+            detail="No translation config. Call POST /translation/{domain}/config first.",
+        )
+
+    langs      = [l.strip().upper() for l in cfg.languages.split(",") if l.strip()]
+    extra_urls = [u.strip() for u in (cfg.extra_urls or "").splitlines() if u.strip()]
+
+    summary = await run_crawl(
+        config_id          = str(cfg.id),
+        domain             = domain,
+        backend_url        = obj.backend_url,
+        languages          = langs,
+        extra_urls         = extra_urls,
+        deepl_api_key      = settings.DEEPL_API_KEY,
+        db_session_factory = lambda: next(get_db()),
+    )
+
+    return CrawlSummaryResponse(
+        **summary,
+        message=f"Crawl complete: {summary['ok']} pages translated, {summary['failed']} failed.",
+    )
+
+
+# ── Serve translated pages (called by translation_worker) ────────────────────
+
+@app.get(
+    "/translated/{domain}/{lang}/{path:path}",
+    tags=["Translation Serve"],
+    include_in_schema=False,
+)
+async def serve_translated_page(
+    domain: str,
+    lang: str,
+    path: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Internal endpoint — called by the translation_worker when a visitor requests a page.
+    Returns the pre-translated HTML from cache if available.
+    Falls back to None (worker will translate on-the-fly if no cache hit).
+    """
+    from fastapi.responses import HTMLResponse, JSONResponse
+
+    # Build the canonical URL
+    obj = db.query(Domain).filter(Domain.domain == domain).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Domain not found")
+
+    full_url = f"{obj.backend_url.rstrip('/')}/{path.lstrip('/')}"
+
+    cfg = db.query(TranslationConfig).filter(
+        TranslationConfig.domain_id == obj.id
+    ).first()
+    if not cfg:
+        return JSONResponse({"cached": False}, status_code=200)
+
+    page = (
+        db.query(TranslatedPage)
+        .filter_by(config_id=cfg.id, url=full_url, language=lang.upper())
+        .filter(TranslatedPage.status == CrawlStatus.DONE)
+        .first()
+    )
+
+    if page and page.html:
+        return HTMLResponse(
+            content=page.html,
+            headers={
+                "X-Translation-Source": "precomputed",
+                "X-Translated-To": lang.upper(),
+                "X-Crawled-At": str(page.crawled_at),
+            },
+        )
+
+    return JSONResponse({"cached": False}, status_code=200)
+
+
+# ── Language-specific sitemap ─────────────────────────────────────────────────
+
+@app.get(
+    "/translated/{domain}/{lang}/sitemap.xml",
+    tags=["Translation Serve"],
+)
+async def serve_translated_sitemap(
+    domain: str,
+    lang: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Returns a sitemap.xml containing only the successfully translated pages
+    for the given language, using the proxy domain URLs.
+
+    Search engines crawling https://{domain}/ will find this sitemap
+    (linked from robots.txt) and index the translated content.
+    """
+    from fastapi.responses import Response as FastAPIResponse
+
+    obj = db.query(Domain).filter(Domain.domain == domain).first()
+    if not obj:
+        raise HTTPException(status_code=404)
+
+    cfg = db.query(TranslationConfig).filter(
+        TranslationConfig.domain_id == obj.id
+    ).first()
+
+    pages = []
+    if cfg:
+        pages = (
+            db.query(TranslatedPage)
+            .filter_by(config_id=cfg.id, language=lang.upper())
+            .filter(TranslatedPage.status == CrawlStatus.DONE)
+            .all()
+        )
+
+    # Build sitemap XML
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"',
+        '        xmlns:xhtml="http://www.w3.org/1999/xhtml">',
+    ]
+    for page in pages:
+        # Rewrite the URL to point to the proxy domain
+        from urllib.parse import urlparse, urlunparse
+        parsed = urlparse(page.url)
+        proxy_url = urlunparse(parsed._replace(
+            scheme="https", netloc=domain
+        ))
+        last_mod = (page.crawled_at or datetime.utcnow()).strftime("%Y-%m-%d")
+        lines += [
+            "  <url>",
+            f"    <loc>{proxy_url}</loc>",
+            f"    <lastmod>{last_mod}</lastmod>",
+            f"    <xhtml:link rel='alternate' hreflang='{lang.lower()}'",
+            f"                href='{proxy_url}'/>",
+            "  </url>",
+        ]
+    lines.append("</urlset>")
+
+    return FastAPIResponse(
+        content="\n".join(lines),
+        media_type="application/xml",
+    )
+
+
+# ── Language-aware robots.txt ─────────────────────────────────────────────────
+
+@app.get(
+    "/translated/{domain}/robots.txt",
+    tags=["Translation Serve"],
+)
+async def serve_translated_robots(
+    domain: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Returns a robots.txt that advertises language-specific sitemaps.
+    Served at https://{domain}/robots.txt by the translation_worker.
+    """
+    from fastapi.responses import PlainTextResponse
+
+    obj = db.query(Domain).filter(Domain.domain == domain).first()
+    cfg = None
+    if obj:
+        cfg = db.query(TranslationConfig).filter(
+            TranslationConfig.domain_id == obj.id
+        ).first()
+
+    lines = [
+        "User-agent: *",
+        "Allow: /",
+        "",
+    ]
+
+    if cfg:
+        langs = [l.strip().upper() for l in cfg.languages.split(",") if l.strip()]
+        for lang in langs:
+            lines.append(
+                f"Sitemap: https://{domain}/sitemap-{lang.lower()}.xml"
+            )
+
+    return PlainTextResponse("\n".join(lines))

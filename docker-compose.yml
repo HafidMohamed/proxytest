@@ -73,11 +73,13 @@ services:
       DEEPL_TIMEOUT:          30
       CACHE_TTL:              300
       CACHE_MAX_PAGES:        500
+      CONTROL_PLANE_URL:      http://control-plane:8000
     ports:
       # Exposed on loopback only — nginx proxy_passes to 127.0.0.1:8001
       - "127.0.0.1:8001:8001"
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8001/worker-health"]
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8001/worker-health', timeout=4)"]
       interval: 10s
       timeout: 5s
       retries: 5

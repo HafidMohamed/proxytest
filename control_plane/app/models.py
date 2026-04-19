@@ -82,3 +82,78 @@ class ProxyRequestLog(Base):
     event      = Column(String(64))      # e.g. ssl_issued, ssl_failed, domain_verified
     detail     = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# ── Translation / SEO models ──────────────────────────────────────────────────
+
+class CrawlFrequency(str, enum.Enum):
+    HOURLY  = "hourly"
+    DAILY   = "daily"
+    WEEKLY  = "weekly"
+    MANUAL  = "manual"
+
+
+class CrawlStatus(str, enum.Enum):
+    PENDING    = "pending"
+    RUNNING    = "running"
+    DONE       = "done"
+    FAILED     = "failed"
+
+
+class TranslationConfig(Base):
+    """
+    Per-domain translation settings.
+    One row per domain — created/updated via the API.
+    """
+    __tablename__ = "translation_configs"
+
+    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    domain_id  = Column(UUID(as_uuid=True), ForeignKey("domains.id", ondelete="CASCADE"),
+                        unique=True, nullable=False)
+    # Comma-separated DeepL language codes, e.g. "DE,FR,ES"
+    languages  = Column(String(256), nullable=False, default="DE")
+    # Crawl interval
+    frequency  = Column(Enum(CrawlFrequency), default=CrawlFrequency.DAILY)
+    # Optional extra URLs to always include (newline-separated)
+    extra_urls = Column(Text, nullable=True)
+    # Last time the full crawl+translate cycle ran
+    last_crawl = Column(DateTime, nullable=True)
+    next_crawl = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    domain = relationship("Domain", backref="translation_config", uselist=False)
+    pages  = relationship("TranslatedPage", back_populates="config",
+                          cascade="all, delete-orphan")
+
+
+class TranslatedPage(Base):
+    """
+    One cached translated page per (domain, url, language).
+    Stored as full HTML in the database so it can be served instantly.
+    """
+    __tablename__ = "translated_pages"
+
+    id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    config_id   = Column(UUID(as_uuid=True), ForeignKey("translation_configs.id",
+                          ondelete="CASCADE"), nullable=False)
+    url         = Column(String(2048), nullable=False)
+    language    = Column(String(10),   nullable=False)   # e.g. "DE"
+    html        = Column(Text,         nullable=True)     # translated HTML
+    status      = Column(Enum(CrawlStatus), default=CrawlStatus.PENDING)
+    error       = Column(Text, nullable=True)
+    crawled_at  = Column(DateTime, nullable=True)
+    # HTTP status code returned by origin
+    origin_status = Column(String(8), nullable=True)
+
+    created_at  = Column(DateTime, default=datetime.utcnow)
+    updated_at  = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    config = relationship("TranslationConfig", back_populates="pages")
+
+    __table_args__ = (
+        # unique per url+language so upsert is safe
+        __import__("sqlalchemy").UniqueConstraint("config_id", "url", "language",
+                                                  name="uq_page_url_lang"),
+    )
