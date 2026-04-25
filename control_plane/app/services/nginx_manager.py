@@ -1,31 +1,36 @@
 """
-Nginx configuration manager.
+Nginx Configuration Manager  (v2)
+===================================
 
-Traffic flow (after provision-ssl):
-  Visitor browser
-    → DNS: cafezisimoukreuzau.de → Cloudflare edge IP  (must be orange cloud!)
-    → Cloudflare edge (adds CF-Connecting-IP: real visitor IP)
-    → Our server port 443 (from a Cloudflare IP → UFW allows it)
-    → Nginx vhost for cafezisimoukreuzau.de
-    → proxy_pass to customer's backend_url (e.g. https://origin.com)
-    → Backend returns response
-    → Nginx forwards response to Cloudflare
-    → Cloudflare forwards to visitor browser
+New in v2:
+  - Subdirectory routing: /de/, /fr/ etc. served from the same domain
+  - Subdomain routing:    de.example.com, fr.example.com  (existing behavior, now explicit)
+  - Per-language location blocks generated automatically from TranslationConfig.languages
+  - Language switcher + hreflang handled by seo_crawler; nginx just routes correctly
 
-CRITICAL: The domain's A record in Cloudflare DNS MUST be set to
-"Proxied" (orange cloud icon), NOT "DNS only" (grey cloud).
+Subdirectory mode (routing_mode=SUBDIRECTORY):
+  One vhost handles all languages + origin.
+  /de/* → worker with X-Translate-Lang: DE
+  /fr/* → worker with X-Translate-Lang: FR
+  /     → origin (no translation)
+
+Subdomain mode (routing_mode=SUBDOMAIN):
+  Original vhost: example.com → origin (unchanged)
+  Per-language vhosts: de.example.com → worker with X-Translate-Lang: DE
+  Customer must add CNAME de.example.com → our server for each language.
 """
 
 import logging
 import subprocess
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, List
 
 from ..config import settings
 
 logger = logging.getLogger(__name__)
 
-# ── Templates ─────────────────────────────────────────────────────────────────
+
+# ── Templates ──────────────────────────────────────────────────────────────
 
 _HTTP_ONLY_CONF = """\
 # HTTP-only vhost for {domain} (pre-SSL)
@@ -33,7 +38,6 @@ server {{
     listen 80;
     server_name {domain};
 
-    # ACME HTTP-01 challenge — port 80 must be open to ALL IPs for this
     location /.well-known/acme-challenge/ {{
         root {acme_webroot};
         try_files $uri =404;
@@ -46,11 +50,15 @@ server {{
 }}
 """
 
-_SSL_CONF = """\
-# Reverse-proxy config for {domain}
+# ── Subdirectory mode: all languages on one domain ─────────────────────────
+# /de/path → translation worker with lang=DE
+# /        → straight proxy to origin (no translation)
+
+_SSL_SUBDIRECTORY_CONF = """\
+# Reverse-proxy config for {domain} (subdirectory routing)
+# Languages: {languages}
 # Auto-generated — do not edit manually
 
-# ── HTTP: ACME challenge + redirect to HTTPS ─────────────────────────────────
 server {{
     listen 80;
     server_name {domain};
@@ -66,100 +74,130 @@ server {{
     }}
 }}
 
-# ── HTTPS: translation proxy ──────────────────────────────────────────────────
-#
-# Traffic flow:
-#   Visitor → Nginx (TLS) → translation_worker:8001 → {backend_url}
-#
-# The translation_worker service:
-#   1. Fetches the origin (URL passed in X-Upstream-URL header).
-#   2. If the response is HTML, extracts all visible text nodes, sends them to
-#      DeepL, and splices the translations back into the DOM.
-#   3. Passes non-HTML responses (images, CSS, JS, …) straight through.
-#   4. Streams the (possibly rewritten) response back to nginx → visitor.
-#
 server {{
     listen 443 ssl;
     http2 on;
     listen [::]:443 ssl;
-    http2 on;
     server_name {domain};
 
     ssl_certificate     {ssl_cert};
     ssl_certificate_key {ssl_key};
     include             {snippets_dir}/ssl-params.conf;
 
-    # NOTE: Cloudflare IP restriction is enforced at two levels:
-    #   1. UFW firewall (kernel): only CF CIDRs can reach port 443 at all.
-    #   2. nginx default_server: unknown domains get 444 (silent drop).
-    #
-    # We do NOT include cloudflare-allow.conf here because nginx.conf already
-    # includes cloudflare-realip.conf globally, which means by the time a
-    # request reaches this vhost, $remote_addr has been rewritten to the REAL
-    # visitor IP (unwrapped from CF-Connecting-IP). An allow/deny check here
-    # would compare real visitor IPs against Cloudflare CIDRs → 403 Forbidden
-    # for every legitimate visitor.
-
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
     add_header X-Content-Type-Options    "nosniff" always;
     add_header X-Frame-Options           "SAMEORIGIN" always;
     add_header Referrer-Policy           "strict-origin-when-cross-origin" always;
 
-    # ── Route ALL requests through the translation worker ─────────────────────
-    #
-    # We tell the worker two things via custom headers:
-    #   X-Upstream-URL   — the full URL to fetch from origin
-    #   X-Translate-Lang — target language (default: from DEEPL_TARGET_LANG env)
-    #
-    # $request_uri preserves the path + query string verbatim.
-    # $scheme is always https here (TLS terminated by this block).
-    #
+{lang_locations}
+
+    # Origin passthrough (no translation)
     location / {{
-        # Build the origin URL nginx passes to the worker.
-        # proxy_set_header cannot contain variables set by set in the same block
-        # when using proxy_pass to a named upstream, so we use a Lua-free trick:
-        # set the variable first, then reference it.
-        set $upstream_url {backend_url}$request_uri;
-
-        # Forward to translation worker (localhost, plain HTTP internally)
-        proxy_pass http://127.0.0.1:{worker_port};
-
+        proxy_pass {backend_url};
         proxy_http_version 1.1;
-
-        # Routing headers consumed by the worker (stripped before going to origin)
-        proxy_set_header X-Upstream-URL   $upstream_url;
-        proxy_set_header X-Translate-Lang {target_lang};
-
-        # WebSocket support — worker passes Upgrade through for non-HTML
-        proxy_set_header Upgrade    $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
-
-        # Pass the real visitor IP so the origin/worker can log it correctly
+        proxy_set_header Host              $host;
         proxy_set_header X-Real-IP         $remote_addr;
         proxy_set_header X-Forwarded-For   $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Original-Host   $host;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_hide_header X-Powered-By;
+        proxy_hide_header Server;
+        proxy_connect_timeout 15s;
+        proxy_send_timeout    60s;
+        proxy_read_timeout    60s;
+    }}
+}}
+"""
 
-        # Forward Cloudflare metadata
-        proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
-        proxy_set_header CF-IPCountry     $http_cf_ipcountry;
-        proxy_set_header CF-Ray           $http_cf_ray;
+_LANG_LOCATION_BLOCK = """\
+    # Language: {lang}
+    location /{lang_lower}/ {{
+        # Strip the language prefix before forwarding to origin via worker
+        rewrite ^/{lang_lower}(/.*)$ $1 break;
+        set $upstream_url {backend_url}$uri$is_args$args;
+
+        proxy_pass http://127.0.0.1:{worker_port};
+        proxy_http_version 1.1;
+
+        proxy_set_header X-Upstream-URL   $upstream_url;
+        proxy_set_header X-Translate-Lang {lang};
+        proxy_set_header X-Original-Host  $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
 
         proxy_hide_header X-Powered-By;
         proxy_hide_header Server;
 
-        # Worker talks plain HTTP; no SSL needed on the loopback leg
-        proxy_ssl_server_name off;
-        proxy_ssl_verify      off;
-
         proxy_connect_timeout 15s;
         proxy_send_timeout    60s;
         proxy_read_timeout    60s;
-
         proxy_buffering         on;
         proxy_buffer_size       16k;
         proxy_buffers          16 16k;
         proxy_busy_buffers_size 32k;
+    }}
+"""
+
+# ── Subdomain mode: de.example.com ────────────────────────────────────────
+
+_SSL_SUBDOMAIN_CONF = """\
+# Reverse-proxy config for {subdomain}.{domain} (subdomain routing, lang={lang})
+# Auto-generated — do not edit manually
+
+server {{
+    listen 80;
+    server_name {subdomain}.{domain};
+
+    location /.well-known/acme-challenge/ {{
+        root {acme_webroot};
+        try_files $uri =404;
+        allow all;
+    }}
+
+    location / {{
+        return 301 https://$host$request_uri;
+    }}
+}}
+
+server {{
+    listen 443 ssl;
+    http2 on;
+    listen [::]:443 ssl;
+    server_name {subdomain}.{domain};
+
+    ssl_certificate     {ssl_cert};
+    ssl_certificate_key {ssl_key};
+    include             {snippets_dir}/ssl-params.conf;
+
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+    add_header X-Content-Type-Options    "nosniff" always;
+
+    location / {{
+        set $upstream_url {backend_url}$request_uri;
+
+        proxy_pass http://127.0.0.1:{worker_port};
+        proxy_http_version 1.1;
+
+        proxy_set_header X-Upstream-URL   $upstream_url;
+        proxy_set_header X-Translate-Lang {lang};
+        proxy_set_header X-Original-Host  $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        proxy_hide_header X-Powered-By;
+        proxy_hide_header Server;
+
+        proxy_connect_timeout 15s;
+        proxy_send_timeout    60s;
+        proxy_read_timeout    60s;
     }}
 }}
 """
@@ -180,103 +218,59 @@ resolver_timeout 5s;
 """
 
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────
 
 def _run(cmd: list, timeout: int = 30) -> Tuple[int, str, str]:
-    """
-    Run a command, prepending sudo only when NOT already root.
-
-    Inside Docker the process runs as root (uid 0) — sudo is not installed
-    in the image and prepending it causes FileNotFoundError. On a bare-metal
-    host the app runs as www-data and needs sudo for root-owned nginx paths.
-    """
     import os
     full_cmd = (["sudo"] + [str(c) for c in cmd]) if os.getuid() != 0 else [str(c) for c in cmd]
     logger.info("Running: %s", " ".join(full_cmd))
     try:
-        result = subprocess.run(
-            full_cmd, capture_output=True, text=True, timeout=timeout
-        )
+        result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode != 0:
-            logger.warning(
-                "Command failed (%d):\nSTDOUT: %s\nSTDERR: %s",
-                result.returncode, result.stdout, result.stderr,
-            )
+            logger.warning("Command failed (%d):\nSTDOUT: %s\nSTDERR: %s",
+                           result.returncode, result.stdout, result.stderr)
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
-        logger.error("Command timed out after %ds: %s", timeout, " ".join(full_cmd))
         return 1, "", f"Command timed out after {timeout}s"
     except FileNotFoundError as exc:
-        logger.error("Command not found: %s — is it installed?", full_cmd[1])
-        return 1, "", f"Command not found: {full_cmd[1]}: {exc}"
+        return 1, "", f"Command not found: {exc}"
     except Exception as exc:
-        logger.exception("Unexpected error running %s", full_cmd)
         return 1, "", f"Unexpected error: {exc}"
 
 
 def _write(path: Path, content: str) -> None:
     import os
-    """
-    Write file content using sudo tee (handles root-owned directories).
-
-    BUG FIX: Original used path.write_text() directly, which fails when the
-    app runs as www-data because /etc/nginx/sites-available/ and
-    /etc/nginx/sites-enabled/ are owned by root.  We now mirror the pattern
-    used in cloudflare_manager.py — pipe content through 'sudo tee' so the
-    write succeeds regardless of directory ownership.
-    """
-    # Ensure parent directory exists
-    rc, _, err = _run(["mkdir", "-p", str(path.parent)], timeout=10)
-    if rc != 0:
-        raise RuntimeError(f"mkdir -p {path.parent} failed: {err}")
-
+    _run(["mkdir", "-p", str(path.parent)], timeout=10)
     result = subprocess.run(
         (["sudo", "tee", str(path)] if os.getuid() != 0 else ["tee", str(path)]),
-        input=content,
-        capture_output=True,
-        text=True,
-        timeout=15,
+        input=content, capture_output=True, text=True, timeout=15,
     )
     if result.returncode != 0:
         raise RuntimeError(f"Failed to write {path}: {result.stderr}")
 
 
-def _available_path(domain: str, suffix: str = "") -> Path:
-    return Path(settings.NGINX_SITES_AVAILABLE) / f"{domain}{suffix}.conf"
+def _available_path(name: str, suffix: str = "") -> Path:
+    return Path(settings.NGINX_SITES_AVAILABLE) / f"{name}{suffix}.conf"
 
 
-def _enabled_path(domain: str, suffix: str = "") -> Path:
-    return Path(settings.NGINX_SITES_ENABLED) / f"{domain}{suffix}.conf"
+def _enabled_path(name: str, suffix: str = "") -> Path:
+    return Path(settings.NGINX_SITES_ENABLED) / f"{name}{suffix}.conf"
 
 
-def _enable(domain: str, suffix: str = "") -> None:
-    """
-    Create symlink sites-enabled → sites-available using sudo ln.
-
-    BUG FIX: Original used enbld.symlink_to() directly, which fails for
-    www-data because /etc/nginx/sites-enabled/ is root-owned.
-    """
-    avail = _available_path(domain, suffix)
-    enbld = _enabled_path(domain, suffix)
-    # Remove stale symlink first
+def _enable(name: str, suffix: str = "") -> None:
+    avail = _available_path(name, suffix)
+    enbld = _enabled_path(name, suffix)
     _run(["rm", "-f", str(enbld)], timeout=10)
-    # Create new symlink (use absolute resolved path as target)
     rc, _, err = _run(["ln", "-sf", str(avail.resolve()), str(enbld)], timeout=10)
     if rc != 0:
-        raise RuntimeError(f"Failed to enable {domain}{suffix}: {err}")
+        raise RuntimeError(f"Failed to enable {name}{suffix}: {err}")
 
 
-def _disable(domain: str, suffix: str = "") -> None:
-    """
-    Remove sites-enabled symlink using sudo rm.
-
-    BUG FIX: Original used enbld.unlink() directly — fails for www-data.
-    """
-    enbld = _enabled_path(domain, suffix)
-    _run(["rm", "-f", str(enbld)], timeout=10)
+def _disable(name: str, suffix: str = "") -> None:
+    _run(["rm", "-f", str(_enabled_path(name, suffix))], timeout=10)
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── Public API ─────────────────────────────────────────────────────────────
 
 class NginxManager:
 
@@ -285,12 +279,8 @@ class NginxManager:
         self._write_ssl_params()
 
     def _ensure_dirs(self):
-        for d in [
-            settings.NGINX_SITES_AVAILABLE,
-            settings.NGINX_SITES_ENABLED,
-            settings.NGINX_SNIPPETS_DIR,
-            settings.NGINX_ACME_WEBROOT,
-        ]:
+        for d in [settings.NGINX_SITES_AVAILABLE, settings.NGINX_SITES_ENABLED,
+                  settings.NGINX_SNIPPETS_DIR, settings.NGINX_ACME_WEBROOT]:
             try:
                 Path(d).mkdir(parents=True, exist_ok=True)
             except PermissionError:
@@ -304,72 +294,140 @@ class NginxManager:
             except Exception as exc:
                 logger.warning("Could not write ssl-params.conf: %s", exc)
 
-    # ── Config writers ────────────────────────────────────────────────────────
+    # ── HTTP-only (pre-SSL) ────────────────────────────────────────────────
 
     def write_http_only_config(self, domain: str) -> str:
-        """Write HTTP-only vhost for ACME challenge before SSL is issued."""
         content = _HTTP_ONLY_CONF.format(
-            domain=domain,
-            acme_webroot=settings.NGINX_ACME_WEBROOT,
-        )
+            domain=domain, acme_webroot=settings.NGINX_ACME_WEBROOT)
         path = _available_path(domain, ".http")
         _write(path, content)
         _enable(domain, ".http")
-        logger.info("HTTP-only config written: %s", domain)
         return str(path)
 
     def remove_http_only_config(self, domain: str) -> None:
         _disable(domain, ".http")
         _run(["rm", "-f", str(_available_path(domain, ".http"))], timeout=10)
 
-    def write_ssl_config(
+    # ── Subdirectory routing (default) ────────────────────────────────────
+
+    def write_subdirectory_config(
         self,
         domain: str,
         backend_url: str,
         ssl_cert: str,
         ssl_key: str,
+        languages: List[str],
         worker_port: int = None,
-        target_lang: str = None,
     ) -> str:
         """
-        Write the full HTTPS reverse-proxy vhost for a customer domain.
-
-        Traffic is routed:
-          Nginx (TLS) → translation_worker:worker_port → backend_url
-
-        The translation worker fetches the origin, translates HTML via DeepL,
-        and streams the result back.  Non-HTML responses are passed unchanged.
-
-        Args:
-            domain:      Customer's public hostname.
-            backend_url: Origin URL (e.g. https://origin.example.com).
-            ssl_cert:    Path to TLS certificate file.
-            ssl_key:     Path to TLS private key file.
-            worker_port: Port translation_worker listens on (default: WORKER_PORT / 8001).
-            target_lang: DeepL target language code (default: TARGET_LANG / "DE").
+        Single vhost handles all language prefixes.
+        /de/* → worker(lang=DE) → origin
+        /fr/* → worker(lang=FR) → origin
+        /     → origin (direct)
         """
         backend_url = backend_url.rstrip("/")
-        effective_worker_port = worker_port or getattr(settings, "WORKER_PORT", 8001)
-        effective_target_lang = target_lang or getattr(settings, "TARGET_LANG", "DE")
-        content = _SSL_CONF.format(
+        wp = worker_port or getattr(settings, "WORKER_PORT", 8001)
+
+        lang_locations = ""
+        for lang in languages:
+            lang_locations += _LANG_LOCATION_BLOCK.format(
+                lang=lang.upper(),
+                lang_lower=lang.lower(),
+                backend_url=backend_url,
+                worker_port=wp,
+            )
+
+        content = _SSL_SUBDIRECTORY_CONF.format(
             domain=domain,
+            languages=",".join(languages),
             backend_url=backend_url,
             ssl_cert=ssl_cert,
             ssl_key=ssl_key,
             acme_webroot=settings.NGINX_ACME_WEBROOT,
             snippets_dir=settings.NGINX_SNIPPETS_DIR,
-            worker_port=effective_worker_port,
-            target_lang=effective_target_lang,
+            lang_locations=lang_locations,
         )
         avail = _available_path(domain)
         _write(avail, content)
         _enable(domain)
         self.remove_http_only_config(domain)
-        logger.info(
-            "SSL proxy config written: %s → worker:%s → %s (lang=%s)",
-            domain, effective_worker_port, backend_url, effective_target_lang,
-        )
+        logger.info("Subdirectory config written: %s langs=%s", domain, languages)
         return str(avail)
+
+    # ── Subdomain routing ─────────────────────────────────────────────────
+
+    def write_subdomain_configs(
+        self,
+        domain: str,
+        backend_url: str,
+        ssl_cert: str,
+        ssl_key: str,
+        languages: List[str],
+        worker_port: int = None,
+    ) -> List[str]:
+        """
+        One vhost per language subdomain: de.domain, fr.domain, etc.
+        Caller is responsible for obtaining wildcard SSL cert or per-subdomain certs.
+        """
+        backend_url = backend_url.rstrip("/")
+        wp = worker_port or getattr(settings, "WORKER_PORT", 8001)
+        paths = []
+        for lang in languages:
+            subdomain = lang.lower()
+            name = f"{subdomain}.{domain}"
+            content = _SSL_SUBDOMAIN_CONF.format(
+                domain=domain,
+                subdomain=subdomain,
+                lang=lang.upper(),
+                backend_url=backend_url,
+                ssl_cert=ssl_cert,
+                ssl_key=ssl_key,
+                acme_webroot=settings.NGINX_ACME_WEBROOT,
+                snippets_dir=settings.NGINX_SNIPPETS_DIR,
+                worker_port=wp,
+            )
+            avail = _available_path(name)
+            _write(avail, content)
+            _enable(name)
+            paths.append(str(avail))
+            logger.info("Subdomain config written: %s (lang=%s)", name, lang)
+        return paths
+
+    # ── Legacy single-lang SSL config (backwards compat) ─────────────────
+
+    def write_ssl_config(self, domain, backend_url, ssl_cert, ssl_key,
+                         worker_port=None, target_lang=None):
+        """Backwards-compatible single-language config."""
+        lang = target_lang or getattr(settings, "TARGET_LANG", "DE")
+        return self.write_subdirectory_config(
+            domain, backend_url, ssl_cert, ssl_key,
+            languages=[lang], worker_port=worker_port,
+        )
+
+    # ── Update languages for existing domain ──────────────────────────────
+
+    def update_languages(
+        self,
+        domain: str,
+        backend_url: str,
+        ssl_cert: str,
+        ssl_key: str,
+        languages: List[str],
+        routing_mode: str = "subdirectory",
+        worker_port: int = None,
+    ) -> Tuple[bool, str]:
+        """Regenerate nginx config when languages list changes."""
+        try:
+            if routing_mode == "subdomain":
+                self.write_subdomain_configs(domain, backend_url, ssl_cert, ssl_key,
+                                             languages, worker_port)
+            else:
+                self.write_subdirectory_config(domain, backend_url, ssl_cert, ssl_key,
+                                               languages, worker_port)
+            ok, msg = self.reload()
+            return ok, msg
+        except Exception as exc:
+            return False, str(exc)
 
     def remove_domain_config(self, domain: str) -> None:
         _disable(domain)
@@ -378,13 +436,11 @@ class NginxManager:
         _run(["rm", "-f", str(_available_path(domain, ".http"))], timeout=10)
         logger.info("Config removed: %s", domain)
 
-    # ── Nginx control ─────────────────────────────────────────────────────────
+    # ── Nginx control ──────────────────────────────────────────────────────
 
     def test_config(self) -> Tuple[bool, str]:
         rc, out, err = _run(["nginx", "-t"])
         msg = (out + err).strip()
-        if rc != 0:
-            logger.error("nginx -t FAILED: %s", msg)
         return rc == 0, msg
 
     def reload(self) -> Tuple[bool, str]:
@@ -393,32 +449,28 @@ class NginxManager:
             return False, f"nginx config test failed: {msg}"
         rc, out, err = _run(["nginx", "-s", "reload"])
         if rc == 0:
-            logger.info("nginx reloaded OK")
             return True, "nginx reloaded"
         return False, f"nginx reload failed: {(out+err).strip()}"
 
-    def safe_write_and_reload(
-        self,
-        domain: str,
-        backend_url: str,
-        ssl_cert: str,
-        ssl_key: str,
-        worker_port: int = None,
-        target_lang: str = None,
-    ) -> Tuple[bool, str, str]:
-        """Write config + reload. Auto-rollback on failure."""
-        config_path = self.write_ssl_config(
-            domain, backend_url, ssl_cert, ssl_key,
-            worker_port=worker_port, target_lang=target_lang,
-        )
-        ok, msg = self.reload()
-        if not ok:
-            self.remove_domain_config(domain)
-            self.reload()
-            return False, "", msg
-        return True, config_path, msg
-
-    # ── Diagnostics ───────────────────────────────────────────────────────────
+    def safe_write_and_reload(self, domain, backend_url, ssl_cert, ssl_key,
+                               worker_port=None, target_lang=None,
+                               languages=None, routing_mode="subdirectory"):
+        langs = languages or ([target_lang] if target_lang else [getattr(settings, "TARGET_LANG", "DE")])
+        try:
+            if routing_mode == "subdomain":
+                config_path = self.write_subdomain_configs(
+                    domain, backend_url, ssl_cert, ssl_key, langs, worker_port)[0]
+            else:
+                config_path = self.write_subdirectory_config(
+                    domain, backend_url, ssl_cert, ssl_key, langs, worker_port)
+            ok, msg = self.reload()
+            if not ok:
+                self.remove_domain_config(domain)
+                self.reload()
+                return False, "", msg
+            return True, config_path, msg
+        except Exception as exc:
+            return False, "", str(exc)
 
     def get_domain_config(self, domain: str) -> str | None:
         p = _available_path(domain)
@@ -432,10 +484,8 @@ class NginxManager:
         if not enabled.exists():
             return []
         try:
-            return [
-                p.stem for p in enabled.iterdir()
-                if p.name.endswith(".conf") and not p.name.endswith(".http.conf")
-            ]
+            return [p.stem for p in enabled.iterdir()
+                    if p.name.endswith(".conf") and not p.name.endswith(".http.conf")]
         except PermissionError:
             return []
 

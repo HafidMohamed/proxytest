@@ -3,13 +3,16 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from .config import settings
 
+# connect_args differ between PostgreSQL and SQLite
+_is_sqlite = settings.DATABASE_URL.startswith("sqlite")
+_connect_args = {} if _is_sqlite else {"connect_timeout": 10}
+_pool_kwargs  = {} if _is_sqlite else {"pool_size": 20, "max_overflow": 40, "pool_recycle": 3600}
+
 engine = create_engine(
     settings.DATABASE_URL,
-    pool_size=20,
-    max_overflow=40,
-    pool_pre_ping=True,          # detects stale connections
-    pool_recycle=3600,           # recycle connections every hour
-    connect_args={"connect_timeout": 10},
+    pool_pre_ping=True,
+    connect_args=_connect_args,
+    **_pool_kwargs,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
